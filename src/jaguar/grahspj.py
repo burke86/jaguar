@@ -58,11 +58,6 @@ def build_grahspj_config_from_image_bands(
         flux, error = image_band_photometry_mjy(band)
         fluxes.append(flux)
         errors.append(max(error, max(abs(flux) * 0.03, 1.0e-8)))
-    prior_config = {
-        "log_stellar_mass": {"dist": "normal", "loc": 9.5, "scale": 1.5},
-    }
-    if extra_prior_config:
-        prior_config.update(extra_prior_config)
     return FitConfig(
         observation=Observation(object_id=object_id, redshift=redshift, fit_redshift=fit_redshift),
         photometry=PhotometryData(
@@ -82,5 +77,5 @@ def build_grahspj_config_from_image_bands(
             use_absolute_flux_scale_prior=False,
         ),
         inference=InferenceConfig(map_steps=300, num_warmup=100, num_samples=100),
-        prior_config=prior_config,
+        prior_config=dict(extra_prior_config or {}),
     )

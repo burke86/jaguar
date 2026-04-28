@@ -71,6 +71,22 @@ def test_star_component_defaults_to_point_source():
     assert component.resolved_spatial == "point"
 
 
+def test_sersic_component_rejects_invalid_reff_bounds():
+    component = SceneComponentConfig(
+        name="host",
+        sed_component="host",
+        kind="sersic",
+        min_reff_arcsec=0.5,
+        max_reff_arcsec=0.4,
+    )
+    try:
+        component.validate()
+    except ValueError as exc:
+        assert "max_reff_arcsec" in str(exc)
+    else:
+        raise AssertionError("Expected invalid reff bounds validation error.")
+
+
 def test_arbitrary_scene_components_render_independently():
     band = _band()
     cfg = JointFitConfig(
@@ -95,6 +111,29 @@ def test_arbitrary_scene_components_render_independently():
     assert np.isclose(np.sum(rendered["star_2_image"]), 7.0)
     assert np.isclose(np.sum(rendered["star"]), 12.0)
     assert np.allclose(rendered["total"], rendered["star"] + rendered["background"])
+
+
+def test_point_source_psf_uncertainty_renders_flux_scaled_variance():
+    psf_uncertainty = np.ones((5, 5), dtype=float) * 0.01
+    band = ImageBandData(
+        image=np.zeros((21, 21), dtype=float),
+        noise=np.ones((21, 21), dtype=float),
+        psf=np.ones((5, 5), dtype=float),
+        psf_uncertainty=psf_uncertainty,
+        filter_name="hsc_i",
+        pixel_scale=0.168,
+    )
+    cfg = JointFitConfig(
+        image_bands=[band],
+        image=ImageFitConfig(fit_background=False),
+        sed_components=[SedComponentConfig(name="agn", kind="agn", grahspj_config=object())],
+        scene_components=[SceneComponentConfig(name="agn_image", sed_component="agn", kind="point", fit_position=False)],
+    )
+
+    rendered = render_joint_model(cfg, {}, fluxes_by_band={"hsc_i": {"agn_image": 10.0}})["hsc_i"]
+
+    assert np.max(rendered["psf_variance"]) > 0.0
+    assert np.isclose(np.max(rendered["psf_variance"]), 0.01)
 
 
 def test_mixed_grahspj_and_star_components_use_full_sed_grid_for_plotting():

@@ -6,7 +6,7 @@ import jax
 import numpyro.distributions as dist
 from types import SimpleNamespace
 
-from jaguar import ComponentFluxes, ImageBandData, ImageFitConfig, JointFitConfig, build_grahspj_config_from_image_bands, fit
+from jaguar import ComponentFluxes, ImageBandData, ImageFitConfig, JointFitConfig, SceneComponentConfig, SedComponentConfig, build_grahspj_config_from_image_bands, fit
 from jaguar.fit import _init_to_values_then_median, _initial_values
 from jaguar.model import render_joint_model
 
@@ -57,6 +57,7 @@ def test_map_fit_smoke(monkeypatch):
         image_bands=[band],
         image=ImageFitConfig(fit_host_morphology=False, fit_background=False),
         grahspj_config=object(),
+        joint_grahspj_fitting=True,
     )
     image = np.asarray(render_joint_model(cfg, {}, fluxes_by_band={"hsc_i": ComponentFluxes(agn=10.0, host=20.0)})["hsc_i"]["total"])
     band = ImageBandData(image, noise, psf, "hsc_i", pixel_scale=0.168, counts_per_mjy=1.0)
@@ -64,11 +65,40 @@ def test_map_fit_smoke(monkeypatch):
         image_bands=[band],
         image=ImageFitConfig(fit_host_morphology=False, fit_background=False),
         grahspj_config=object(),
+        joint_grahspj_fitting=True,
     )
     result = fit(cfg, fit_method="map_only", map_steps=2, progress_bar=False)
     summary = result.summary()
     assert np.isclose(summary["hsc_i_agn_flux"], 10.0)
     assert np.isclose(summary["hsc_i_host_flux"], 20.0)
+
+
+def test_map_fit_defaults_to_image_fluxes_without_grahspj_likelihood(monkeypatch):
+    import jaguar.model as model_mod
+
+    def fail_grahspj(*_args, **_kwargs):
+        raise AssertionError("grahspj likelihood should not run by default")
+
+    monkeypatch.setattr(model_mod, "_grahspj_state_from_trace", fail_grahspj)
+    shape = (21, 21)
+    psf = np.ones((5, 5), dtype=float)
+    noise = np.ones(shape, dtype=float) * 5.0
+    band = ImageBandData(np.zeros(shape), noise, psf, "hsc_i", pixel_scale=0.168, counts_per_mjy=1.0)
+    photometry = SimpleNamespace(filter_names=["hsc_i"], fluxes=[10.0], errors=[1.0])
+    sed_cfg = SimpleNamespace(photometry=photometry)
+    cfg = JointFitConfig(
+        image_bands=[band],
+        image=ImageFitConfig(fit_host_morphology=False, fit_background=False),
+        sed_components=[
+            SedComponentConfig(name="agn", kind="agn", grahspj_config=sed_cfg),
+            SedComponentConfig(name="host", kind="host", grahspj_config=sed_cfg),
+        ],
+    )
+
+    result = fit(cfg, fit_method="map_only", map_steps=1, progress_bar=False)
+
+    assert any(name.endswith("/hsc_i/log_flux") for name in result.map_params)
+    assert result.grahspj_state["pred_fluxes"].shape == (1,)
 
 
 def test_map_fit_accepts_integer_background_default(monkeypatch):
@@ -113,6 +143,35 @@ def test_grahspj_config_does_not_override_log_agn_amp_with_log10_scale():
     )
     cfg = build_grahspj_config_from_image_bands([band], dsps_ssp_fn="/tmp/not-used.h5")
     assert "log_agn_amp" not in cfg.prior_config
+    assert "log_stellar_mass" not in cfg.prior_config
+
+
+def test_initial_values_clip_sersic_reff_to_bounds():
+    shape = (21, 21)
+    band = ImageBandData(
+        image=np.zeros(shape, dtype=float),
+        noise=np.ones(shape, dtype=float),
+        psf=np.ones((5, 5), dtype=float),
+        filter_name="hsc_i",
+        pixel_scale=0.168,
+    )
+    cfg = JointFitConfig(
+        image_bands=[band],
+        sed_components=[SedComponentConfig(name="host", kind="host", grahspj_config=object())],
+        scene_components=[
+            SceneComponentConfig(
+                name="host",
+                sed_component="host",
+                kind="sersic",
+                fixed_reff_arcsec=0.1,
+                min_reff_arcsec=0.25,
+            )
+        ],
+    )
+
+    values = _initial_values(cfg)
+
+    assert float(values["host/reff_arcsec"]) > 0.25
 
 
 def test_unspecified_grahspj_sites_initialize_at_prior_median():

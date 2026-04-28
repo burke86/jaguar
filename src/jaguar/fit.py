@@ -12,7 +12,7 @@ from numpyro.infer import MCMC, NUTS, SVI, Trace_ELBO, init_to_median
 from numpyro.infer.autoguide import AutoDelta
 
 from .config import JointFitConfig
-from .model import _scene_fluxes_by_band, _grahspj_state_from_trace, ensure_grahspj_context, jaguar_model, render_joint_model
+from .model import _image_fluxes_by_band, _initial_scene_flux_count, _scene_flux_param_name, _scene_fluxes_by_band, _grahspj_state_from_trace, ensure_grahspj_context, image_flux_state_from_fluxes, jaguar_model, render_joint_model
 from .result import JaguarResult
 
 
@@ -22,15 +22,35 @@ def _float_init(value: Any) -> jnp.ndarray:
     return jnp.asarray(value, dtype=jnp.float64)
 
 
+def _bounded_float_init(value: Any, *, low: float | None = None, high: float | None = None) -> jnp.ndarray:
+    """Coerce an initial latent value and keep it inside finite prior support."""
+
+    initial = float(value)
+    if low is not None:
+        initial = max(initial, float(low) + 1.0e-8)
+    if high is not None:
+        initial = min(initial, float(high) - 1.0e-8)
+    return _float_init(initial)
+
+
 def _initial_values(config: JointFitConfig) -> dict[str, Any]:
     values: dict[str, Any] = {}
     image = config.image
     for scene in config.resolved_scene_components:
+        for band in config.image_bands:
+            if not config.joint_grahspj_fitting:
+                values[_scene_flux_param_name(scene, band.filter_name)] = _float_init(
+                    np.log(_initial_scene_flux_count(config, scene, band))
+                )
         if scene.fit_position:
             values[f"{scene.name}/center_x_pix"] = _float_init(scene.fixed_center_x_pix)
             values[f"{scene.name}/center_y_pix"] = _float_init(scene.fixed_center_y_pix)
         if scene.kind == "sersic" and scene.fit_shape:
-            values[f"{scene.name}/reff_arcsec"] = _float_init(scene.fixed_reff_arcsec)
+            values[f"{scene.name}/reff_arcsec"] = _bounded_float_init(
+                scene.fixed_reff_arcsec,
+                low=scene.min_reff_arcsec,
+                high=scene.max_reff_arcsec,
+            )
             values[f"{scene.name}/n_sersic"] = _float_init(scene.fixed_n_sersic)
             values[f"{scene.name}/e1"] = _float_init(scene.fixed_e1)
             values[f"{scene.name}/e2"] = _float_init(scene.fixed_e2)
@@ -67,15 +87,21 @@ def fit_map(
     """Run an Optax MAP fit."""
 
     config.validate()
-    ensure_grahspj_context(config)
+    if config.joint_grahspj_fitting:
+        ensure_grahspj_context(config)
     rng_key = jax.random.PRNGKey(seed)
     guide = AutoDelta(jaguar_model, init_loc_fn=_init_to_values_then_median(_initial_values(config)))
     svi = SVI(jaguar_model, guide, optax.adam(learning_rate), Trace_ELBO())
     svi_result = svi.run(rng_key, int(steps), config, progress_bar=progress_bar)
     params = svi_result.params
     map_params = guide.median(params)
-    grahspj_state = _grahspj_state_from_trace(config, map_params, add_likelihood=False, include_components=True)
-    rendered = render_joint_model(config, map_params, fluxes_by_band=_scene_fluxes_by_band(config, grahspj_state))
+    if config.joint_grahspj_fitting:
+        grahspj_state = _grahspj_state_from_trace(config, map_params, add_likelihood=False, include_components=True)
+        fluxes_by_band = _scene_fluxes_by_band(config, grahspj_state)
+    else:
+        fluxes_by_band = _image_fluxes_by_band(config, map_params)
+        grahspj_state = image_flux_state_from_fluxes(config, fluxes_by_band)
+    rendered = render_joint_model(config, map_params, fluxes_by_band=fluxes_by_band)
     return JaguarResult(
         config=config,
         map_params={k: np.asarray(v) for k, v in map_params.items()},
@@ -109,8 +135,13 @@ def fit(
     mcmc.run(jax.random.PRNGKey(seed + 1), config)
     samples = mcmc.get_samples()
     median_params = {k: jnp.nanmedian(v, axis=0) for k, v in samples.items()}
-    grahspj_state = _grahspj_state_from_trace(config, median_params, add_likelihood=False, include_components=True)
-    rendered = render_joint_model(config, median_params, fluxes_by_band=_scene_fluxes_by_band(config, grahspj_state))
+    if config.joint_grahspj_fitting:
+        grahspj_state = _grahspj_state_from_trace(config, median_params, add_likelihood=False, include_components=True)
+        fluxes_by_band = _scene_fluxes_by_band(config, grahspj_state)
+    else:
+        fluxes_by_band = _image_fluxes_by_band(config, median_params)
+        grahspj_state = image_flux_state_from_fluxes(config, fluxes_by_band)
+    rendered = render_joint_model(config, median_params, fluxes_by_band=fluxes_by_band)
     return JaguarResult(
         config=config,
         map_params={k: np.asarray(v) for k, v in median_params.items()},
