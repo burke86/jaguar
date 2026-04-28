@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jaguar"
+version = "0.1.0"
+description = "Joint AGN-Galaxy Unified Analysis & Reconstruction"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [
+  { name = "JAGUAR contributors" }
+]
+dependencies = [
+  "numpy",
+  "jax>=0.4.30",
+  "jaxlib>=0.4.30",
+  "numpyro>=0.15",
+  "optax",
+  "astropy",
+  "photutils",
+  "matplotlib",
+  "corner",
+  "grahspj",
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest",
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
