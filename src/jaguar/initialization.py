@@ -10,7 +10,7 @@ import numpy as np
 from .config import ImageBandData, ImageFitConfig, SceneComponentConfig, SedComponentConfig
 from .grahspj import ensure_counts_per_mjy
 from .model import _GALAXY_KINDS
-from .render import convolve_fft_same, psf_unit_flux, sersic_ellipse_unit_flux
+from .render import bounded_psf_padding, convolve_fft_same, pad_psf, psf_unit_flux, sersic_ellipse_unit_flux
 
 
 def _edge_background(image: np.ndarray) -> float:
@@ -34,10 +34,12 @@ def _scene_sample_pixel(scene: SceneComponentConfig, band: ImageBandData) -> tup
 
 def _unit_scene_image(scene: SceneComponentConfig, band: ImageBandData) -> np.ndarray:
     shape = tuple(band.image.shape)
+    psf_padding = bounded_psf_padding(tuple(band.psf.shape), shape, band.psf_padding_pixels)
+    psf = pad_psf(jnp.asarray(band.psf), psf_padding)
     center_x = float(scene.fixed_center_x_pix)
     center_y = float(scene.fixed_center_y_pix)
     if scene.kind == "point":
-        unit = psf_unit_flux(jnp.asarray(band.psf), shape, center_x, center_y)
+        unit = psf_unit_flux(psf, shape, center_x, center_y)
     elif scene.kind == "sersic":
         unit = sersic_ellipse_unit_flux(
             shape,
@@ -49,7 +51,7 @@ def _unit_scene_image(scene: SceneComponentConfig, band: ImageBandData) -> np.nd
             center_x,
             center_y,
         )
-        unit = convolve_fft_same(unit, jnp.asarray(band.psf))
+        unit = convolve_fft_same(unit, psf)
     else:  # pragma: no cover - config validation catches this
         raise ValueError(f"Unsupported scene component kind {scene.kind!r}.")
     return np.asarray(unit, dtype=float)
@@ -128,22 +130,11 @@ def _with_component_photometry(
 ) -> Any:
     if cfg is None:
         return None
+    del kind, total_flux_by_filter
     fluxes = [max(float(flux_by_filter.get(band.filter_name, 0.0)), 1.0e-12) for band in image_bands]
     errors = [max(abs(flux) * 0.2, 1.0e-8) for flux in fluxes]
     photometry = replace(cfg.photometry, fluxes=fluxes, errors=errors)
-    prior_config = dict(getattr(cfg, "prior_config", {}) or {})
-    if kind in _GALAXY_KINDS and total_flux_by_filter:
-        total = np.asarray([max(float(total_flux_by_filter.get(band.filter_name, 0.0)), 1.0e-12) for band in image_bands])
-        comp = np.asarray(fluxes, dtype=float)
-        ratio = float(np.nanmedian(comp / np.maximum(total, 1.0e-12)))
-        base = prior_config.get("log_stellar_mass", {"loc": 9.5})
-        base_loc = float(base.get("loc", 9.5)) if isinstance(base, Mapping) else 9.5
-        prior_config["log_stellar_mass"] = {
-            "dist": "normal",
-            "loc": float(np.clip(base_loc + np.log10(max(ratio, 1.0e-4)), 5.0, 12.5)),
-            "scale": 1.0,
-        }
-    return replace(cfg, photometry=photometry, prior_config=prior_config)
+    return replace(cfg, photometry=photometry)
 
 
 def initialize_sed_component_amplitudes_from_pixels(
@@ -153,6 +144,7 @@ def initialize_sed_component_amplitudes_from_pixels(
     *,
     total_grahspj_config: Any | None = None,
     background_by_filter: Mapping[str, float] | None = None,
+    host_to_agn_initial_flux_ratio: float | None = 0.1,
 ) -> list[SedComponentConfig]:
     """Return SED components with pixel-informed rough amplitude settings."""
 
@@ -171,8 +163,24 @@ def initialize_sed_component_amplitudes_from_pixels(
         }
     initialized: list[SedComponentConfig] = []
     filter_names = [band.filter_name for band in bands]
+    agn_component_names = {component.name for component in sed_components if component.kind == "agn"}
+    agn_flux_by_filter: dict[str, float] = {}
+    for agn_name in agn_component_names:
+        for name, flux in sed_fluxes.get(agn_name, {}).items():
+            agn_flux_by_filter[name] = agn_flux_by_filter.get(name, 0.0) + float(flux)
+    use_host_to_agn_ratio = (
+        host_to_agn_initial_flux_ratio is not None
+        and np.isfinite(float(host_to_agn_initial_flux_ratio))
+        and float(host_to_agn_initial_flux_ratio) > 0.0
+        and any(flux > 0.0 for flux in agn_flux_by_filter.values())
+    )
     for component in sed_components:
         flux_by_filter = sed_fluxes.get(component.name, {})
+        if component.kind in _GALAXY_KINDS and use_host_to_agn_ratio:
+            flux_by_filter = {
+                name: max(float(host_to_agn_initial_flux_ratio) * float(agn_flux_by_filter.get(name, 0.0)), 1.0e-12)
+                for name in filter_names
+            }
         positive = np.asarray([float(flux_by_filter.get(name, np.nan)) for name in filter_names], dtype=float)
         positive = positive[np.isfinite(positive) & (positive > 0.0)]
         if component.kind == "star" and positive.size:

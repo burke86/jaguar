@@ -5,12 +5,13 @@ from dataclasses import replace
 from typing import Any
 
 import jax.numpy as jnp
+import numpy as np
 import numpyro
 import numpyro.distributions as dist
 from numpyro import handlers
 
 from .config import ComponentFluxes, JointFitConfig, SceneComponentConfig, SedComponentConfig, coerce_component_fluxes
-from .render import convolve_fft_same, psf_unit_flux, sersic_ellipse_unit_flux
+from .render import bounded_psf_padding, convolve_fft_same, pad_psf, psf_unit_flux, psf_unit_flux_uncertainty, sersic_ellipse_unit_flux
 
 
 _H_PLANCK = 6.62607015e-34
@@ -364,6 +365,103 @@ def _scene_fluxes_by_band(config: JointFitConfig, state: Mapping[str, Any]) -> d
     return out
 
 
+def _scene_flux_param_name(scene: SceneComponentConfig, filter_name: str) -> str:
+    """Return the NumPyro site name for one scene flux in one image band."""
+
+    return f"{scene.name}/{filter_name}/log_flux"
+
+
+def _initial_scene_flux_count(config: JointFitConfig, scene: SceneComponentConfig, band) -> float:
+    """Return a positive image-count flux scale for one scene component."""
+
+    if config.fixed_component_fluxes and band.filter_name in config.fixed_component_fluxes:
+        fixed = config.fixed_component_fluxes[band.filter_name]
+        if isinstance(fixed, Mapping) and scene.name in fixed:
+            return max(float(fixed[scene.name]), 1.0e-12)
+    sed_by_name = {component.name: component for component in config.resolved_sed_components}
+    sed = sed_by_name.get(scene.sed_component)
+    if sed is not None and sed.kind == "star":
+        return max(float(sed.reference_flux_mjy) * float(band.counts_per_mjy or 1.0), 1.0e-12)
+    cfg = getattr(sed, "grahspj_config", None) if sed is not None else None
+    photometry = getattr(cfg, "photometry", None)
+    if photometry is not None and band.filter_name in list(photometry.filter_names):
+        index = list(photometry.filter_names).index(band.filter_name)
+        return max(float(photometry.fluxes[index]) * float(band.counts_per_mjy or 1.0), 1.0e-12)
+    return max(float(np.nanmedian(np.clip(np.asarray(band.image, dtype=float), 0.0, None))), 1.0e-12)
+
+
+def _image_fluxes_by_band(config: JointFitConfig, sampled: Mapping[str, Any]) -> dict[str, dict[str, jnp.ndarray]]:
+    """Map sampled per-scene image fluxes to each image band."""
+
+    out: dict[str, dict[str, jnp.ndarray]] = {}
+    for band in config.image_bands:
+        out[band.filter_name] = {}
+        for scene in config.resolved_scene_components:
+            name = _scene_flux_param_name(scene, band.filter_name)
+            default = np.log(_initial_scene_flux_count(config, scene, band))
+            out[band.filter_name][scene.name] = jnp.exp(jnp.asarray(sampled.get(name, default), dtype=jnp.float64))
+    return out
+
+
+def _sample_image_fluxes(config: JointFitConfig) -> dict[str, Any]:
+    """Sample independent per-band scene fluxes for image-only fitting."""
+
+    sampled: dict[str, Any] = {}
+    sigma = float(config.image_flux_prior_sigma)
+    for band in config.image_bands:
+        for scene in config.resolved_scene_components:
+            name = _scene_flux_param_name(scene, band.filter_name)
+            loc = np.log(_initial_scene_flux_count(config, scene, band))
+            sampled[name] = numpyro.sample(name, dist.Normal(loc, sigma))
+    return sampled
+
+
+def image_flux_state_from_fluxes(config: JointFitConfig, fluxes_by_band: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    """Return a grahspj-like band-flux state from rendered image flux parameters."""
+
+    filter_names = [band.filter_name for band in config.image_bands]
+    sed_by_name = {component.name: component for component in config.resolved_sed_components}
+    component_fluxes = {
+        component.name: np.zeros(len(filter_names), dtype=float)
+        for component in config.resolved_sed_components
+    }
+    for i, band in enumerate(config.image_bands):
+        scale = float(band.counts_per_mjy or 1.0)
+        for scene in config.resolved_scene_components:
+            flux_counts = float(np.asarray(fluxes_by_band[band.filter_name][scene.name]))
+            component_fluxes[scene.sed_component][i] += flux_counts / scale
+    pred_fluxes = np.zeros(len(filter_names), dtype=float)
+    agn_fluxes = np.zeros(len(filter_names), dtype=float)
+    host_fluxes = np.zeros(len(filter_names), dtype=float)
+    star_fluxes = np.zeros(len(filter_names), dtype=float)
+    for name, fluxes in component_fluxes.items():
+        component = sed_by_name[name]
+        pred_fluxes += fluxes
+        if component.kind == "agn":
+            agn_fluxes += fluxes
+        elif component.kind in _GALAXY_KINDS:
+            host_fluxes += fluxes
+        elif component.kind == "star":
+            star_fluxes += fluxes
+    return {
+        "pred_fluxes": pred_fluxes,
+        "agn_fluxes": agn_fluxes,
+        "host_fluxes": host_fluxes,
+        "star_fluxes": star_fluxes,
+        "dust_fluxes": np.zeros_like(pred_fluxes),
+        "nebular_fluxes": np.zeros_like(pred_fluxes),
+        "component_fluxes": component_fluxes,
+        "component_states": {
+            name: {"kind": sed_by_name[name].kind, "pred_fluxes": fluxes}
+            for name, fluxes in component_fluxes.items()
+        },
+        "rest_wave": np.asarray([]),
+        "obs_wave": np.asarray([]),
+        "total_rest_sed": np.asarray([]),
+        "total_obs_sed": np.asarray([]),
+    }
+
+
 def _scene_param_name(scene: SceneComponentConfig, param: str) -> str:
     """Return the NumPyro site/parameter name for one scene component parameter."""
 
@@ -401,9 +499,15 @@ def _sample_scene_parameters(config: JointFitConfig) -> dict[str, Any]:
         n_sigma = float(scene.n_sersic_sigma if scene.n_sersic_sigma is not None else priors.n_sersic_sigma)
         ell_sigma = float(scene.ellipticity_sigma if scene.ellipticity_sigma is not None else priors.ellipticity_sigma)
         if scene.fit_shape:
+            reff_dist = dist.TruncatedNormal(
+                reff_loc,
+                reff_sigma,
+                low=float(scene.min_reff_arcsec),
+                high=float(scene.max_reff_arcsec) if scene.max_reff_arcsec is not None else None,
+            )
             sampled[_scene_param_name(scene, "reff_arcsec")] = numpyro.sample(
                 _scene_param_name(scene, "reff_arcsec"),
-                dist.TruncatedNormal(reff_loc, reff_sigma, low=1.0e-3),
+                reff_dist,
             )
             sampled[_scene_param_name(scene, "n_sersic")] = numpyro.sample(
                 _scene_param_name(scene, "n_sersic"),
@@ -440,7 +544,13 @@ def render_band_model(
     """Render AGN, host, and total image components for one band."""
 
     shape = tuple(band.image.shape)
-    psf = psf_unit_flux(jnp.asarray(band.psf), shape, center_x_pix, center_y_pix)
+    psf = psf_unit_flux(
+        jnp.asarray(band.psf),
+        shape,
+        center_x_pix,
+        center_y_pix,
+        padding_pixels=band.psf_padding_pixels,
+    )
     host_unit = sersic_ellipse_unit_flux(
         shape,
         float(band.pixel_scale),
@@ -454,9 +564,22 @@ def render_band_model(
     agn = psf * jnp.asarray(fluxes.agn, dtype=jnp.float64)
     star = psf * jnp.asarray(fluxes.star, dtype=jnp.float64)
     host = host_unit * jnp.asarray(fluxes.host, dtype=jnp.float64)
+    psf_variance = jnp.zeros(shape, dtype=jnp.float64)
+    if band.psf_uncertainty is not None:
+        psf_uncertainty = psf_unit_flux_uncertainty(
+            jnp.asarray(band.psf_uncertainty),
+            shape,
+            center_x_pix,
+            center_y_pix,
+            padding_pixels=band.psf_padding_pixels,
+        )
+        psf_variance = (
+            (jnp.asarray(fluxes.agn, dtype=jnp.float64) * psf_uncertainty) ** 2
+            + (jnp.asarray(fluxes.star, dtype=jnp.float64) * psf_uncertainty) ** 2
+        )
     background_image = jnp.ones(shape, dtype=jnp.float64) * background
     total = agn + star + host + background_image
-    return {"total": total, "agn": agn, "star": star, "host": host, "background": background_image}
+    return {"total": total, "agn": agn, "star": star, "host": host, "background": background_image, "psf_variance": psf_variance}
 
 
 def render_joint_model(
@@ -475,12 +598,15 @@ def render_joint_model(
     sed_by_name = {component.name: component for component in config.resolved_sed_components}
     for i, band in enumerate(config.image_bands):
         shape = tuple(band.image.shape)
+        psf_padding = bounded_psf_padding(tuple(band.psf.shape), shape, band.psf_padding_pixels)
+        band_psf = pad_psf(jnp.asarray(band.psf), psf_padding)
         background = params.get(f"background_{i}", config.image.background_default)
         background_image = jnp.ones(shape, dtype=jnp.float64) * background
         total = background_image
         agn = jnp.zeros(shape, dtype=jnp.float64)
         host = jnp.zeros(shape, dtype=jnp.float64)
         star = jnp.zeros(shape, dtype=jnp.float64)
+        psf_variance = jnp.zeros(shape, dtype=jnp.float64)
         band_payload = fluxes_by_band[band.filter_name]
         if isinstance(band_payload, ComponentFluxes) or not isinstance(band_payload, Mapping):
             legacy = band_payload if isinstance(band_payload, ComponentFluxes) else coerce_component_fluxes(band_payload)
@@ -502,7 +628,16 @@ def render_joint_model(
             center_x = _scene_param(params, scene, "center_x_pix", scene.fixed_center_x_pix)
             center_y = _scene_param(params, scene, "center_y_pix", scene.fixed_center_y_pix)
             if scene.kind == "point":
-                image = psf_unit_flux(jnp.asarray(band.psf), shape, center_x, center_y) * flux
+                image = psf_unit_flux(band_psf, shape, center_x, center_y) * flux
+                if band.psf_uncertainty is not None:
+                    psf_uncertainty = psf_unit_flux_uncertainty(
+                        jnp.asarray(band.psf_uncertainty),
+                        shape,
+                        center_x,
+                        center_y,
+                        padding_pixels=band.psf_padding_pixels,
+                    )
+                    psf_variance = psf_variance + (flux * psf_uncertainty) ** 2
             elif scene.kind == "sersic":
                 unit = sersic_ellipse_unit_flux(
                     shape,
@@ -514,7 +649,7 @@ def render_joint_model(
                     center_x,
                     center_y,
                 )
-                unit = convolve_fft_same(unit, jnp.asarray(band.psf))
+                unit = convolve_fft_same(unit, band_psf)
                 image = unit * flux
             else:  # pragma: no cover - validate catches this
                 raise ValueError(f"Unsupported scene component kind {scene.kind!r}.")
@@ -533,6 +668,7 @@ def render_joint_model(
             "host": host,
             "star": star,
             "background": background_image,
+            "psf_variance": psf_variance,
             "components": components,
             **components,
         }
@@ -548,9 +684,13 @@ def jaguar_model(config: JointFitConfig) -> None:
     """
 
     config.validate()
-    grahspj_state = _grahspj_state_from_trace(config, None, add_likelihood=True, include_components=False)
-    fluxes_by_band = _scene_fluxes_by_band(config, grahspj_state)
     sampled = _sample_scene_parameters(config)
+    if config.joint_grahspj_fitting:
+        grahspj_state = _grahspj_state_from_trace(config, None, add_likelihood=True, include_components=False)
+        fluxes_by_band = _scene_fluxes_by_band(config, grahspj_state)
+    else:
+        sampled.update(_sample_image_fluxes(config))
+        fluxes_by_band = _image_fluxes_by_band(config, sampled)
 
     for i, _band in enumerate(config.image_bands):
         if config.image.fit_background:
@@ -568,6 +708,8 @@ def jaguar_model(config: JointFitConfig) -> None:
         mask = jnp.ones_like(model, dtype=bool) if band.mask is None else jnp.asarray(band.mask, dtype=bool)
         data = jnp.asarray(band.image, dtype=jnp.float64)
         noise = jnp.asarray(band.noise, dtype=jnp.float64)
+        psf_variance = jnp.asarray(rendered[band.filter_name].get("psf_variance", 0.0), dtype=jnp.float64)
+        noise = jnp.sqrt(jnp.maximum(noise * noise + psf_variance, 1.0e-24))
         resid = jnp.where(mask, (data - model) / noise, 0.0)
         if config.image.use_student_t:
             log_prob = dist.StudentT(config.image.student_t_df, 0.0, 1.0).log_prob(resid)

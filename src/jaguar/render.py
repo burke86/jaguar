@@ -11,6 +11,29 @@ def normalize_image(image: jnp.ndarray) -> jnp.ndarray:
     return jnp.asarray(image, dtype=jnp.float64) / jnp.maximum(total, 1.0e-30)
 
 
+def bounded_psf_padding(psf_shape: tuple[int, int], image_shape: tuple[int, int], padding_pixels: int) -> int:
+    """Return PSF padding that fits within an image stamp."""
+
+    padding = int(padding_pixels)
+    if padding <= 0:
+        return 0
+    max_y = max((int(image_shape[0]) - int(psf_shape[0])) // 2, 0)
+    max_x = max((int(image_shape[1]) - int(psf_shape[1])) // 2, 0)
+    return min(padding, max_y, max_x)
+
+
+def pad_psf(psf: jnp.ndarray, padding_pixels: int = 0) -> jnp.ndarray:
+    """Zero-pad a PSF image and normalize it to unit flux."""
+
+    psf = normalize_image(psf)
+    padding = int(padding_pixels)
+    if padding <= 0:
+        return psf
+
+    padded = jnp.pad(psf, ((padding, padding), (padding, padding)), mode="constant", constant_values=0.0)
+    return normalize_image(jnp.clip(padded, 0.0, jnp.inf))
+
+
 def convolve_fft_same(image: jnp.ndarray, kernel: jnp.ndarray) -> jnp.ndarray:
     """FFT-convolve an image with a centered kernel and return the image-sized result."""
 
@@ -79,7 +102,7 @@ def sersic_ellipse_unit_flux(
     return normalize_image(jnp.clip(image, 0.0, jnp.inf))
 
 
-def shift_image_bilinear(image: jnp.ndarray, dx_pix: jnp.ndarray, dy_pix: jnp.ndarray) -> jnp.ndarray:
+def shift_image_bilinear_raw(image: jnp.ndarray, dx_pix: jnp.ndarray, dy_pix: jnp.ndarray) -> jnp.ndarray:
     """Shift an image by sub-pixel offsets using bilinear interpolation."""
 
     image = jnp.asarray(image, dtype=jnp.float64)
@@ -105,13 +128,39 @@ def shift_image_bilinear(image: jnp.ndarray, dx_pix: jnp.ndarray, dy_pix: jnp.nd
         + sample(x0, y1) * (1.0 - wx) * wy
         + sample(x1, y1) * wx * wy
     )
-    return normalize_image(jnp.clip(shifted, 0.0, jnp.inf))
+    return shifted
 
 
-def psf_unit_flux(psf: jnp.ndarray, shape: tuple[int, int], dx_pix: jnp.ndarray = 0.0, dy_pix: jnp.ndarray = 0.0) -> jnp.ndarray:
+def shift_image_bilinear(image: jnp.ndarray, dx_pix: jnp.ndarray, dy_pix: jnp.ndarray) -> jnp.ndarray:
+    """Shift an image by sub-pixel offsets and preserve unit total flux."""
+
+    return normalize_image(jnp.clip(shift_image_bilinear_raw(image, dx_pix, dy_pix), 0.0, jnp.inf))
+
+
+def pad_psf_uncertainty(psf_uncertainty: jnp.ndarray, padding_pixels: int = 0) -> jnp.ndarray:
+    """Zero-pad a PSF uncertainty image without renormalizing it."""
+
+    uncertainty = jnp.asarray(psf_uncertainty, dtype=jnp.float64)
+    padding = int(padding_pixels)
+    if padding <= 0:
+        return uncertainty
+
+    padded = jnp.pad(uncertainty, ((padding, padding), (padding, padding)), mode="constant", constant_values=0.0)
+    return jnp.clip(padded, 0.0, jnp.inf)
+
+
+def psf_unit_flux(
+    psf: jnp.ndarray,
+    shape: tuple[int, int],
+    dx_pix: jnp.ndarray = 0.0,
+    dy_pix: jnp.ndarray = 0.0,
+    *,
+    padding_pixels: int = 0,
+) -> jnp.ndarray:
     """Center a PSF image in a science stamp and normalize it to unit flux."""
 
-    psf = normalize_image(psf)
+    padding = bounded_psf_padding(tuple(psf.shape), shape, padding_pixels)
+    psf = pad_psf(psf, padding)
     ny, nx = shape
     py, px = psf.shape
     canvas = jnp.zeros(shape, dtype=jnp.float64)
@@ -119,3 +168,24 @@ def psf_unit_flux(psf: jnp.ndarray, shape: tuple[int, int], dx_pix: jnp.ndarray 
     x0 = (nx - px) // 2
     canvas = canvas.at[y0 : y0 + py, x0 : x0 + px].set(psf)
     return shift_image_bilinear(canvas, dx_pix, dy_pix)
+
+
+def psf_unit_flux_uncertainty(
+    psf_uncertainty: jnp.ndarray,
+    shape: tuple[int, int],
+    dx_pix: jnp.ndarray = 0.0,
+    dy_pix: jnp.ndarray = 0.0,
+    *,
+    padding_pixels: int = 0,
+) -> jnp.ndarray:
+    """Center a unit-normalized PSF uncertainty image in a science stamp."""
+
+    padding = bounded_psf_padding(tuple(psf_uncertainty.shape), shape, padding_pixels)
+    uncertainty = pad_psf_uncertainty(psf_uncertainty, padding)
+    ny, nx = shape
+    py, px = uncertainty.shape
+    canvas = jnp.zeros(shape, dtype=jnp.float64)
+    y0 = (ny - py) // 2
+    x0 = (nx - px) // 2
+    canvas = canvas.at[y0 : y0 + py, x0 : x0 + px].set(uncertainty)
+    return jnp.clip(shift_image_bilinear_raw(canvas, dx_pix, dy_pix), 0.0, jnp.inf)

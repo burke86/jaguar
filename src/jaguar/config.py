@@ -34,12 +34,14 @@ class ImageBandData:
     psf: np.ndarray
     filter_name: str
     pixel_scale: float
+    psf_uncertainty: np.ndarray | None = None
     effective_wavelength: float | None = None
     zeropoint: float | None = None
     counts_per_mjy: float | None = None
     mask: np.ndarray | None = None
     header: Mapping[str, Any] | None = None
     target_pixel: tuple[float, float] | None = None
+    psf_padding_pixels: int = 0
 
     def validate(self) -> None:
         if self.image.ndim != 2:
@@ -48,18 +50,26 @@ class ImageBandData:
             raise ValueError("noise must match image shape.")
         if self.psf.ndim != 2:
             raise ValueError("psf must be a 2D array.")
+        if self.psf_uncertainty is not None and np.asarray(self.psf_uncertainty).shape != self.psf.shape:
+            raise ValueError("psf_uncertainty must match psf shape.")
         if self.mask is not None and self.mask.shape != self.image.shape:
             raise ValueError("mask must match image shape.")
         if not np.isfinite(self.pixel_scale) or self.pixel_scale <= 0.0:
             raise ValueError("pixel_scale must be positive and finite.")
         if self.counts_per_mjy is not None and (not np.isfinite(self.counts_per_mjy) or self.counts_per_mjy <= 0.0):
             raise ValueError("counts_per_mjy must be positive and finite when set.")
+        if int(self.psf_padding_pixels) != self.psf_padding_pixels or self.psf_padding_pixels < 0:
+            raise ValueError("psf_padding_pixels must be a non-negative integer.")
         if np.any(~np.isfinite(self.image)):
             raise ValueError("image contains non-finite values.")
         if np.any(~np.isfinite(self.noise)) or np.any(self.noise <= 0.0):
             raise ValueError("noise must be finite and strictly positive.")
         if np.any(~np.isfinite(self.psf)):
             raise ValueError("psf contains non-finite values.")
+        if self.psf_uncertainty is not None:
+            psf_uncertainty = np.asarray(self.psf_uncertainty)
+            if np.any(~np.isfinite(psf_uncertainty)) or np.any(psf_uncertainty < 0.0):
+                raise ValueError("psf_uncertainty must be finite and non-negative.")
 
 
 @dataclass(frozen=True)
@@ -154,6 +164,8 @@ class SceneComponentConfig:
     fixed_e2: float = 0.0
     reff_arcsec_loc: float | None = None
     reff_arcsec_sigma: float | None = None
+    min_reff_arcsec: float = 1.0e-3
+    max_reff_arcsec: float | None = None
     n_sersic_loc: float | None = None
     n_sersic_sigma: float | None = None
     ellipticity_sigma: float | None = None
@@ -172,6 +184,11 @@ class SceneComponentConfig:
                 raise ValueError(f"Scene component {self.name!r} fixed_reff_arcsec must be positive and finite.")
             if not np.isfinite(float(self.fixed_n_sersic)) or float(self.fixed_n_sersic) <= 0.0:
                 raise ValueError(f"Scene component {self.name!r} fixed_n_sersic must be positive and finite.")
+            if not np.isfinite(float(self.min_reff_arcsec)) or float(self.min_reff_arcsec) <= 0.0:
+                raise ValueError(f"Scene component {self.name!r} min_reff_arcsec must be positive and finite.")
+            if self.max_reff_arcsec is not None:
+                if not np.isfinite(float(self.max_reff_arcsec)) or float(self.max_reff_arcsec) <= float(self.min_reff_arcsec):
+                    raise ValueError(f"Scene component {self.name!r} max_reff_arcsec must be finite and larger than min_reff_arcsec.")
 
 
 @dataclass
@@ -186,12 +203,16 @@ class JointFitConfig:
     scene_components: Sequence[SceneComponentConfig] | None = None
     fixed_component_fluxes: Mapping[str, ComponentFluxes | Mapping[str, float]] | None = None
     component_flux_model: FluxModel | None = None
+    joint_grahspj_fitting: bool = False
+    image_flux_prior_sigma: float = 3.0
 
     def validate(self) -> None:
         if not self.image_bands:
             raise ValueError("At least one image band is required.")
         if self.grahspj_config is None and not self.sed_components:
             raise ValueError("grahspj_config or sed_components is required for unified JAGUAR fitting.")
+        if not np.isfinite(float(self.image_flux_prior_sigma)) or float(self.image_flux_prior_sigma) <= 0.0:
+            raise ValueError("image_flux_prior_sigma must be positive and finite.")
         component_names: set[str] = set()
         for component in self.resolved_sed_components:
             component.validate()
