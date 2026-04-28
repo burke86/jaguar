@@ -1,0 +1,10 @@
+numpy
+jax>=0.4.30
+jaxlib>=0.4.30
+numpyro>=0.15
+optax
+astropy
+photutils
+matplotlib
+corner
+grahspj
