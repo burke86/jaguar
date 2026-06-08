@@ -189,14 +189,13 @@ def plot_fit(
         ("Data - Point Source", data_minus_point),
         ("Residual", resid),
     ]
-    science_images = [image for title, image in panels if title != "Residual"]
-    science_min = min(float(np.nanmin(image)) for image in science_images)
-    offset = max(0.0, -science_min)
-    shifted_science = [image + offset for image in science_images]
+    _data_display, data_vmin, data_vmax = _log_display_image(data, log_floor_fraction)
+    data_finite = data[np.isfinite(data)]
+    offset = max(0.0, -float(np.nanmin(data_finite))) if data_finite.size else 0.0
     if shared_vmax is None:
-        shared_vmax = max(float(np.nanpercentile(image, 99.5)) for image in shifted_science)
+        shared_vmax = data_vmax
     if shared_vmin is None:
-        shared_vmin = max(float(shared_vmax) * float(log_floor_fraction), 1.0e-30)
+        shared_vmin = data_vmin
     fig = plt.figure(figsize=(3.0 * (len(panels) + 1), 4.0), constrained_layout=False)
     grid = fig.add_gridspec(1, 5, width_ratios=[1, 1, 1, 1, 1], wspace=0.08)
     image_axes = [fig.add_subplot(grid[:, i]) for i in range(len(panels))]
@@ -395,6 +394,44 @@ def _log_display_image(image: np.ndarray, log_floor_fraction: float) -> tuple[np
     return np.clip(display, vmin, max(vmax, vmin)), vmin, max(vmax, vmin)
 
 
+def _percentile_log_display_image(
+    image: np.ndarray,
+    log_floor_fraction: float,
+    *,
+    lower_percentile: float = 5.0,
+    upper_percentile: float = 99.7,
+    mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, float, float]:
+    finite = np.asarray(image, dtype=float)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape != finite.shape:
+            raise ValueError("mask must match image shape.")
+        finite_values = finite[np.isfinite(finite) & mask]
+    else:
+        finite_values = finite[np.isfinite(finite)]
+    if finite_values.size == 0:
+        return np.ones_like(finite, dtype=float), 1.0, 1.0
+    lower = float(np.nanpercentile(finite_values, lower_percentile))
+    upper = float(np.nanpercentile(finite_values, upper_percentile))
+    if not np.isfinite(lower) or not np.isfinite(upper) or upper <= lower:
+        if mask is not None and finite_values.size:
+            vmax = max(abs(float(np.nanmedian(finite_values))), 1.0e-30)
+            vmin = max(vmax * float(log_floor_fraction), 1.0e-30)
+            display = np.where(mask, vmax, vmin)
+            return display, vmin, vmax
+        return _log_display_image(image, log_floor_fraction)
+    display = finite - lower
+    scale = max(upper - lower, 1.0e-30)
+    positive = display[np.isfinite(display) & (display > 0.0)]
+    vmin = max(scale * float(log_floor_fraction), float(np.nanmin(positive)) if positive.size else 1.0e-30, 1.0e-30)
+    vmax = max(scale, vmin)
+    display = np.clip(display, vmin, vmax)
+    if mask is not None:
+        display = np.where(mask, display, vmin)
+    return display, vmin, vmax
+
+
 def plot_psf_candidates(
     image: np.ndarray,
     candidates,
@@ -478,6 +515,7 @@ def plot_empirical_psf_selection(
     figsize: tuple[float, float] | None = None,
     cmap: str = "viridis",
     log_floor_fraction: float = 1.0e-4,
+    display_percentiles: tuple[float, float] = (5.0, 99.7),
 ):
     """Plot empirical PSF candidates selected by ``build_empirical_psfs_for_bands``."""
 
@@ -498,9 +536,9 @@ def plot_empirical_psf_selection(
 
     n_bands = len(band_results)
     if figsize is None:
-        figsize = (4.8 * n_bands, 4.6)
-    fig, axes = plt.subplots(1, n_bands, figsize=figsize, constrained_layout=True, squeeze=False)
-    axes = axes[0]
+        figsize = (6.0, 4.4 * n_bands)
+    fig, axes = plt.subplots(n_bands, 1, figsize=figsize, constrained_layout=True, squeeze=False)
+    axes = axes[:, 0]
     colors = plt.rcParams["axes.prop_cycle"].by_key().get("color", ["cyan"])
     psf_size = int(result.config.psf_size)
     half = float(psf_size) / 2.0
@@ -509,7 +547,14 @@ def plot_empirical_psf_selection(
 
     for ax, band_result in zip(axes, band_results, strict=True):
         image = np.asarray(band_result.search_image, dtype=float)
-        display, vmin, vmax = _log_display_image(image, log_floor_fraction)
+        search_mask = getattr(band_result, "search_mask", None)
+        display, vmin, vmax = _percentile_log_display_image(
+            image,
+            log_floor_fraction,
+            lower_percentile=float(display_percentiles[0]),
+            upper_percentile=float(display_percentiles[1]),
+            mask=search_mask,
+        )
         im = ax.imshow(display, origin="lower", cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax))
         ax.set_title(f"PSF candidates: {band_result.band_code}")
         ax.set_xticks([])

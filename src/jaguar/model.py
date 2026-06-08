@@ -11,7 +11,15 @@ import numpyro.distributions as dist
 from numpyro import handlers
 
 from .config import ComponentFluxes, JointFitConfig, SceneComponentConfig, SedComponentConfig, coerce_component_fluxes
-from .render import bounded_psf_padding, convolve_fft_same, pad_psf, psf_unit_flux, psf_unit_flux_uncertainty, sersic_ellipse_unit_flux
+from .render import (
+    bounded_psf_padding,
+    convolve_fft_same_precomputed,
+    pad_psf,
+    prepare_fft_kernel,
+    psf_unit_flux,
+    psf_unit_flux_uncertainty,
+    sersic_ellipse_unit_flux,
+)
 
 
 _H_PLANCK = 6.62607015e-34
@@ -600,6 +608,7 @@ def render_joint_model(
         shape = tuple(band.image.shape)
         psf_padding = bounded_psf_padding(tuple(band.psf.shape), shape, band.psf_padding_pixels)
         band_psf = pad_psf(jnp.asarray(band.psf), psf_padding)
+        band_psf_fft = prepare_fft_kernel(band_psf, shape)
         background = params.get(f"background_{i}", config.image.background_default)
         background_image = jnp.ones(shape, dtype=jnp.float64) * background
         total = background_image
@@ -649,7 +658,7 @@ def render_joint_model(
                     center_x,
                     center_y,
                 )
-                unit = convolve_fft_same(unit, band_psf)
+                unit = convolve_fft_same_precomputed(unit, *band_psf_fft)
                 image = unit * flux
             else:  # pragma: no cover - validate catches this
                 raise ValueError(f"Unsupported scene component kind {scene.kind!r}.")
@@ -704,7 +713,6 @@ def jaguar_model(config: JointFitConfig) -> None:
     rendered = render_joint_model(config, sampled, fluxes_by_band=fluxes_by_band)
     for band in config.image_bands:
         model = rendered[band.filter_name]["total"]
-        numpyro.deterministic(f"model_{band.filter_name}", model)
         mask = jnp.ones_like(model, dtype=bool) if band.mask is None else jnp.asarray(band.mask, dtype=bool)
         data = jnp.asarray(band.image, dtype=jnp.float64)
         noise = jnp.asarray(band.noise, dtype=jnp.float64)

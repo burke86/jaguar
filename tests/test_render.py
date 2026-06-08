@@ -2,7 +2,16 @@ from __future__ import annotations
 
 import numpy as np
 
-from jaguar.render import pad_psf, psf_unit_flux, psf_unit_flux_uncertainty, sersic_ellipse_unit_flux
+from jaguar.render import (
+    convolve_fft_same,
+    convolve_fft_same_precomputed,
+    pad_psf,
+    pixel_coordinates,
+    prepare_fft_kernel,
+    psf_unit_flux,
+    psf_unit_flux_uncertainty,
+    sersic_ellipse_unit_flux,
+)
 
 
 def test_psf_normalization_preserves_flux():
@@ -54,3 +63,25 @@ def test_sersic_normalization_preserves_flux():
     assert np.isfinite(image).all()
     assert np.isclose(image.sum(), 1.0)
     assert image.max() > image.mean()
+
+
+def test_precomputed_fft_convolution_matches_direct_convolution():
+    image = np.zeros((17, 19), dtype=float)
+    image[8, 9] = 1.0
+    image[6, 12] = 0.2
+    kernel = np.ones((5, 7), dtype=float)
+
+    direct = np.asarray(convolve_fft_same(image, kernel))
+    prepared = prepare_fft_kernel(kernel, image.shape)
+    precomputed = np.asarray(convolve_fft_same_precomputed(image, *prepared))
+
+    assert np.allclose(precomputed, direct)
+    assert np.isclose(precomputed.sum(), 1.0)
+
+
+def test_pixel_coordinate_grids_are_cached():
+    xx1, yy1 = pixel_coordinates((11, 13), 0.2)
+    xx2, yy2 = pixel_coordinates((11, 13), 0.2)
+
+    assert xx1 is xx2
+    assert yy1 is yy2

@@ -9,17 +9,24 @@ from astropy.table import Table
 from astropy.wcs import WCS
 
 from jaguar.io import (
+    EmpiricalPsfBandResult,
     EmpiricalPsfConfig,
+    EmpiricalPsfResult,
+    ImageBandData,
     PsfCandidate,
     _construct_empirical_psf_from_candidates,
     build_empirical_psfs_for_bands,
+    build_empirical_psfs_for_galex_bands,
+    combine_empirical_psf_results,
     construct_empirical_psf,
+    download_galex_coadd_blocks,
     find_legacy_survey_brick,
     find_empirical_psf_candidates,
     legacy_survey_coadd_url,
     load_hsc_band,
     load_legacy_survey_coadd_band,
     nanomaggy_counts_per_mjy,
+    query_galex_coadd_products,
     read_legacy_survey_coadd_image,
 )
 
@@ -44,6 +51,14 @@ def _install_fake_xmatch(monkeypatch, query):
     xmatch_module.XMatch = types.SimpleNamespace(query=query)
     monkeypatch.setitem(sys.modules, "astroquery", astroquery_module)
     monkeypatch.setitem(sys.modules, "astroquery.xmatch", xmatch_module)
+
+
+def _install_fake_mast_observations(monkeypatch, observations):
+    astroquery_module = types.ModuleType("astroquery")
+    mast_module = types.ModuleType("astroquery.mast")
+    mast_module.Observations = observations
+    monkeypatch.setitem(sys.modules, "astroquery", astroquery_module)
+    monkeypatch.setitem(sys.modules, "astroquery.mast", mast_module)
 
 
 def _write_legacy_test_coadds(data_dir, brick, band, image, ivar, header):
@@ -100,6 +115,105 @@ def test_legacy_survey_coadd_url_uses_dr10_static_paths():
     assert "dr10/south/coadd/000/0000p004" in url
     assert url.endswith("legacysurvey-0000p004-image-i.fits.fz")
     assert "fits-cutout" not in url
+
+
+def test_query_galex_coadd_products_returns_main_intensity_maps(monkeypatch):
+    class FakeObservations:
+        @staticmethod
+        def query_criteria(**kwargs):
+            assert kwargs["obs_collection"] == "GALEX"
+            assert kwargs["dataproduct_type"] == "image"
+            return Table(rows=[("obs",)], names=("obsid",))
+
+        @staticmethod
+        def get_product_list(_observations):
+            return Table(
+                rows=[
+                    ("FUV", "SCIENCE", "AIS_326_sg34-fd-int.fits.gz", "mast:GALEX/url/data/GR6/pipe/AIS_326/d/01-main/0001-img/07-try/AIS_326_sg34-fd-int.fits.gz", "1"),
+                    ("FUV", "SCIENCE", "AIS_326_0001_sg34-fd-int.fits.gz", "mast:GALEX/url/data/GR6/pipe/AIS_326/d/00-visits/0001-img/07-try/AIS_326_0001_sg34-fd-int.fits.gz", "1"),
+                    ("NUV", "SCIENCE", "AIS_326_sg34-nd-int.fits.gz", "mast:GALEX/url/data/GR6/pipe/AIS_326/d/01-main/0001-img/07-try/AIS_326_sg34-nd-int.fits.gz", "1"),
+                    ("NUV", "SCIENCE", "AIS_326_sg34-nd-cnt.fits.gz", "mast:GALEX/url/data/GR6/pipe/AIS_326/d/01-main/0001-img/07-try/AIS_326_sg34-nd-cnt.fits.gz", "1"),
+                    ("NUV", "PREVIEW", "AIS_326_sg34-nd-int.jpg", "mast:GALEX/url/data/GR6/pipe/AIS_326/d/01-main/0001-img/07-try/AIS_326_sg34-nd-int.jpg", "1"),
+                ],
+                names=("filters", "productType", "productFilename", "dataURI", "obsID"),
+            )
+
+    _install_fake_mast_observations(monkeypatch, FakeObservations)
+
+    products = query_galex_coadd_products((180.737219, -20.934155))
+
+    assert [product.product_filename for product in products["FUV"]] == ["AIS_326_sg34-fd-int.fits.gz"]
+    assert [product.product_filename for product in products["NUV"]] == ["AIS_326_sg34-nd-int.fits.gz"]
+
+
+def test_download_galex_coadd_blocks_selects_wcs_containing_target(monkeypatch, tmp_path):
+    target_ra_dec = (180.737219, -20.934155)
+    calls = []
+
+    def write_image(path, crval):
+        wcs = WCS(naxis=2)
+        wcs.wcs.crpix = [10.0, 10.0]
+        wcs.wcs.crval = list(crval)
+        wcs.wcs.cdelt = [-1.5 / 3600.0, 1.5 / 3600.0]
+        wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+        fits.PrimaryHDU(np.ones((21, 21), dtype=float), header=wcs.to_header()).writeto(path, overwrite=True)
+
+    class FakeObservations:
+        @staticmethod
+        def query_criteria(**_kwargs):
+            return Table(rows=[("obs",)], names=("obsid",))
+
+        @staticmethod
+        def get_product_list(_observations):
+            return Table(
+                rows=[
+                    ("FUV", "SCIENCE", "fuv-hit-fd-int.fits.gz", "mast:GALEX/url/data/d/01-main/fuv-hit", "1"),
+                    ("NUV", "SCIENCE", "nuv-a-miss-nd-int.fits.gz", "mast:GALEX/url/data/d/01-main/nuv-miss", "1"),
+                    ("NUV", "SCIENCE", "nuv-hit-nd-int.fits.gz", "mast:GALEX/url/data/d/01-main/nuv-hit", "1"),
+                ],
+                names=("filters", "productType", "productFilename", "dataURI", "obsID"),
+            )
+
+        @staticmethod
+        def download_file(uri, *, local_path=None, **_kwargs):
+            calls.append(uri)
+            crval = (10.0, 10.0) if uri.endswith("nuv-miss") else target_ra_dec
+            write_image(local_path, crval)
+
+    _install_fake_mast_observations(monkeypatch, FakeObservations)
+
+    paths = download_galex_coadd_blocks(tmp_path, target_ra_dec)
+
+    assert paths["FUV"].name == "fuv-hit-fd-int.fits.gz"
+    assert paths["NUV"].name == "nuv-hit-nd-int.fits.gz"
+    assert calls == [
+        "mast:GALEX/url/data/d/01-main/fuv-hit",
+        "mast:GALEX/url/data/d/01-main/nuv-miss",
+        "mast:GALEX/url/data/d/01-main/nuv-hit",
+    ]
+
+
+def test_download_galex_coadd_blocks_uses_cached_files_before_mast(monkeypatch, tmp_path):
+    target_ra_dec = (180.737219, -20.934155)
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [10.0, 10.0]
+    wcs.wcs.crval = list(target_ra_dec)
+    wcs.wcs.cdelt = [-1.5 / 3600.0, 1.5 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    fits.PrimaryHDU(np.ones((21, 21), dtype=float), header=wcs.to_header()).writeto(tmp_path / "cached-fd-int.fits.gz")
+    fits.PrimaryHDU(np.ones((21, 21), dtype=float), header=wcs.to_header()).writeto(tmp_path / "cached-nd-int.fits.gz")
+
+    class FakeObservations:
+        @staticmethod
+        def query_criteria(**_kwargs):
+            raise AssertionError("MAST should not be queried when cached GALEX blocks contain the target")
+
+    _install_fake_mast_observations(monkeypatch, FakeObservations)
+
+    paths = download_galex_coadd_blocks(tmp_path, target_ra_dec)
+
+    assert paths["FUV"].name == "cached-fd-int.fits.gz"
+    assert paths["NUV"].name == "cached-nd-int.fits.gz"
 
 
 def test_find_legacy_survey_brick_from_summary_table(tmp_path):
@@ -535,3 +649,131 @@ def test_build_empirical_psfs_for_bands_prefers_common_stars(tmp_path):
     assert result.image_bands[0].psf_uncertainty.shape == (15, 15)
     assert np.isclose(np.sum(result.bands["g"].psf), 1.0)
     assert [band.psf_padding_pixels for band in result.image_bands] == [3, 3]
+
+
+def test_build_empirical_psfs_for_galex_bands_uses_empirical_psf_pipeline(monkeypatch, tmp_path):
+    target_ra_dec = (180.737219, -20.934155)
+    shape = (101, 101)
+    wcs = WCS(naxis=2)
+    wcs.wcs.crpix = [51.0, 51.0]
+    wcs.wcs.crval = list(target_ra_dec)
+    wcs.wcs.cdelt = [-1.5 / 3600.0, 1.5 / 3600.0]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    header = wcs.to_header()
+
+    def write_galex_image(path, amp):
+        image = np.ones(shape, dtype=float) * 0.01
+        image[:8, :] = 0.0
+        image += _gaussian(shape, 30, 30, 1.2, amp)
+        image += _gaussian(shape, 70, 30, 1.2, 0.8 * amp)
+        image += _gaussian(shape, 51, 51, 1.5, 2.0 * amp)
+        image[:8, :] = 0.0
+        fits.PrimaryHDU(image, header=header).writeto(path, overwrite=True)
+
+    class FakeObservations:
+        @staticmethod
+        def query_criteria(**_kwargs):
+            return Table(rows=[("obs",)], names=("obsid",))
+
+        @staticmethod
+        def get_product_list(_observations):
+            return Table(
+                rows=[
+                    ("FUV", "SCIENCE", "fuv-fd-int.fits.gz", "mast:GALEX/url/data/d/01-main/fuv", "1"),
+                    ("NUV", "SCIENCE", "nuv-nd-int.fits.gz", "mast:GALEX/url/data/d/01-main/nuv", "1"),
+                ],
+                names=("filters", "productType", "productFilename", "dataURI", "obsID"),
+            )
+
+        @staticmethod
+        def download_file(uri, *, local_path=None, **_kwargs):
+            write_galex_image(local_path, 80.0 if uri.endswith("fuv") else 100.0)
+
+    _install_fake_mast_observations(monkeypatch, FakeObservations)
+
+    result = build_empirical_psfs_for_galex_bands(
+        target_ra_dec=target_ra_dec,
+        data_dir=tmp_path,
+        fit_radius=10,
+        config=EmpiricalPsfConfig(
+            psf_size=15,
+            psf_search_radius=45,
+            threshold_sigma=5.0,
+            max_sources=1,
+            target_exclusion_radius_pix=10.0,
+            prefer_common_stars=True,
+            min_common_bands=1,
+            psf_padding_pixels=3,
+        ),
+    )
+
+    assert result.brick == "GALEX"
+    assert set(result.bands) == {"FUV", "NUV"}
+    assert [band.filter_name for band in result.image_bands] == ["galex.FUV", "galex.NUV"]
+    assert all(band.image.shape == (21, 21) for band in result.image_bands)
+    assert all(band.psf.shape == (15, 15) for band in result.image_bands)
+    assert all(band.psf_uncertainty.shape == (15, 15) for band in result.image_bands)
+    assert all(np.isclose(np.sum(band.psf), 1.0) for band in result.image_bands)
+    assert all(band.counts_per_mjy > 0.0 for band in result.image_bands)
+    assert result.bands["FUV"].invvar_path is None
+    assert result.bands["FUV"].search_mask.shape == result.bands["FUV"].search_image.shape
+    assert not np.all(result.bands["FUV"].search_mask)
+
+
+def test_combine_empirical_psf_results_keeps_all_bands(tmp_path):
+    psf = np.ones((5, 5), dtype=float) / 25.0
+    band_a = ImageBandData(np.ones((7, 7)), np.ones((7, 7)), psf, "a", pixel_scale=1.0)
+    band_b = ImageBandData(np.ones((7, 7)), np.ones((7, 7)), psf, "b", pixel_scale=1.0)
+    candidate = PsfCandidate(3.0, 3.0, 10.0, 1.0, 10.0)
+    wcs = WCS(naxis=2)
+    result_a = EmpiricalPsfResult(
+        brick="A",
+        image_bands=[band_a],
+        bands={
+            "a": EmpiricalPsfBandResult(
+                band_code="a",
+                filter_name="a",
+                image_path=tmp_path / "a.fits",
+                invvar_path=None,
+                psf=psf,
+                candidates=[candidate],
+                selected_candidates=[candidate],
+                search_image=np.ones((7, 7)),
+                search_target_pixel=(3.0, 3.0),
+                search_wcs=wcs,
+                full_target_pixel=(3.0, 3.0),
+                search_origin=(0, 0),
+            )
+        },
+        common_star_groups=[{"a": candidate}],
+        config=EmpiricalPsfConfig(),
+    )
+    result_b = EmpiricalPsfResult(
+        brick="B",
+        image_bands=[band_b],
+        bands={
+            "b": EmpiricalPsfBandResult(
+                band_code="b",
+                filter_name="b",
+                image_path=tmp_path / "b.fits",
+                invvar_path=None,
+                psf=psf,
+                candidates=[candidate],
+                selected_candidates=[candidate],
+                search_image=np.ones((7, 7)),
+                search_target_pixel=(3.0, 3.0),
+                search_wcs=wcs,
+                full_target_pixel=(3.0, 3.0),
+                search_origin=(0, 0),
+            )
+        },
+        common_star_groups=[{"b": candidate}],
+        config=EmpiricalPsfConfig(),
+    )
+
+    combined = combine_empirical_psf_results(result_a, result_b)
+
+    assert combined.brick == "A+B"
+    assert [band.filter_name for band in combined.image_bands] == ["a", "b"]
+    assert set(combined.bands) == {"a", "b"}
+    assert len(combined.common_star_groups) == 2

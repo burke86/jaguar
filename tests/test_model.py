@@ -3,8 +3,10 @@ from __future__ import annotations
 import numpy as np
 from types import SimpleNamespace
 
+from numpyro import handlers
+
 from jaguar import ComponentFluxes, ImageBandData, ImageFitConfig, JointFitConfig, SceneComponentConfig, SedComponentConfig, build_grahspj_config_from_image_bands
-from jaguar.model import _blackbody_state, _combine_component_states, _component_grahspj_config, render_joint_model
+from jaguar.model import _blackbody_state, _combine_component_states, _component_grahspj_config, jaguar_model, render_joint_model
 
 
 def _band(mask=None):
@@ -217,3 +219,23 @@ def test_masked_pixels_do_not_change_rendered_model():
     )
     rendered = render_joint_model(cfg, {}, fluxes_by_band={"hsc_i": ComponentFluxes(agn=10.0, host=20.0)})["hsc_i"]["total"]
     assert rendered.shape == (21, 21)
+
+
+def test_jaguar_model_does_not_store_full_model_images_in_trace():
+    cfg = JointFitConfig(
+        image_bands=[_band()],
+        image=ImageFitConfig(fit_background=False),
+        sed_components=[
+            SedComponentConfig(name="agn", kind="agn", grahspj_config=object()),
+            SedComponentConfig(name="host", kind="host", grahspj_config=object()),
+        ],
+        scene_components=[
+            SceneComponentConfig(name="agn_image", sed_component="agn", kind="point", fit_position=False),
+            SceneComponentConfig(name="host_image", sed_component="host", kind="sersic", fit_position=False, fit_shape=False),
+        ],
+    )
+
+    trace = handlers.trace(handlers.seed(jaguar_model, rng_seed=0)).get_trace(cfg)
+
+    assert "model_hsc_i" not in trace
+    assert "pixels_hsc_i" in trace

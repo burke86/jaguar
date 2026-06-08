@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from functools import lru_cache
+
 import jax.numpy as jnp
 from jax import lax
 
@@ -37,30 +39,61 @@ def pad_psf(psf: jnp.ndarray, padding_pixels: int = 0) -> jnp.ndarray:
 def convolve_fft_same(image: jnp.ndarray, kernel: jnp.ndarray) -> jnp.ndarray:
     """FFT-convolve an image with a centered kernel and return the image-sized result."""
 
-    image = jnp.asarray(image, dtype=jnp.float64)
+    prepared = prepare_fft_kernel(kernel, tuple(image.shape))
+    return convolve_fft_same_precomputed(image, *prepared)
+
+
+def prepare_fft_kernel(
+    kernel: jnp.ndarray,
+    image_shape: tuple[int, int],
+) -> tuple[jnp.ndarray, tuple[int, int], tuple[int, int], tuple[int, int]]:
+    """Precompute the FFT state for repeatedly convolving images with one kernel."""
+
     kernel = normalize_image(jnp.asarray(kernel, dtype=jnp.float64))
-    ny, nx = image.shape
-    ky, kx = kernel.shape
+    ny, nx = (int(image_shape[0]), int(image_shape[1]))
+    ky, kx = (int(kernel.shape[0]), int(kernel.shape[1]))
     full_shape = (ny + ky - 1, nx + kx - 1)
-    padded_image = jnp.pad(image, ((0, ky - 1), (0, kx - 1)))
     padded_kernel = jnp.pad(kernel, ((0, ny - 1), (0, nx - 1)))
+    kernel_fft = jnp.fft.rfftn(padded_kernel, s=full_shape)
+    start = ((ky - 1) // 2, (kx - 1) // 2)
+    return kernel_fft, (ky, kx), full_shape, start
+
+
+def convolve_fft_same_precomputed(
+    image: jnp.ndarray,
+    kernel_fft: jnp.ndarray,
+    kernel_shape: tuple[int, int],
+    full_shape: tuple[int, int],
+    start: tuple[int, int],
+) -> jnp.ndarray:
+    """FFT-convolve using a precomputed centered kernel FFT."""
+
+    image = jnp.asarray(image, dtype=jnp.float64)
+    ny, nx = image.shape
+    ky, kx = kernel_shape
+    padded_image = jnp.pad(image, ((0, ky - 1), (0, kx - 1)))
     convolved = jnp.fft.irfftn(
-        jnp.fft.rfftn(padded_image, s=full_shape) * jnp.fft.rfftn(padded_kernel, s=full_shape),
+        jnp.fft.rfftn(padded_image, s=full_shape) * kernel_fft,
         s=full_shape,
     )
-    start_y = (ky - 1) // 2
-    start_x = (kx - 1) // 2
-    same = lax.dynamic_slice(convolved, (start_y, start_x), (ny, nx))
+    same = lax.dynamic_slice(convolved, start, (ny, nx))
     return normalize_image(jnp.clip(same, 0.0, jnp.inf))
 
 
-def pixel_coordinates(shape: tuple[int, int], pixel_scale: float) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Centered pixel coordinates in arcsec."""
+@lru_cache(maxsize=64)
+def _cached_pixel_coordinates(shape: tuple[int, int], pixel_scale: float) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Cached centered pixel coordinate grids in arcsec."""
 
     ny, nx = shape
     y = (jnp.arange(ny, dtype=jnp.float64) - (ny - 1) / 2.0) * pixel_scale
     x = (jnp.arange(nx, dtype=jnp.float64) - (nx - 1) / 2.0) * pixel_scale
     return jnp.meshgrid(x, y)
+
+
+def pixel_coordinates(shape: tuple[int, int], pixel_scale: float) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Centered pixel coordinates in arcsec."""
+
+    return _cached_pixel_coordinates((int(shape[0]), int(shape[1])), float(pixel_scale))
 
 
 def ellipticity_to_q_phi(e1: jnp.ndarray, e2: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:

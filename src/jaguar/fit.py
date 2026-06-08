@@ -120,6 +120,7 @@ def fit(
     learning_rate: float = 5.0e-3,
     nuts_warmup: int = 500,
     nuts_samples: int = 500,
+    nuts_dense_mass: bool = True,
     progress_bar: bool = True,
 ) -> JaguarResult:
     """Fit the joint image model."""
@@ -130,7 +131,11 @@ def fit(
         raise ValueError("fit_method must be 'map_only' or 'optax+nuts'.")
     map_result = fit_map(config, seed=seed, steps=map_steps, learning_rate=learning_rate, progress_bar=progress_bar)
     init_values = {k: jnp.asarray(v) for k, v in (map_result.map_params or {}).items()}
-    kernel = NUTS(jaguar_model, init_strategy=_init_to_values_then_median(init_values))
+    kernel = NUTS(
+        jaguar_model,
+        init_strategy=_init_to_values_then_median(init_values),
+        dense_mass=bool(nuts_dense_mass),
+    )
     mcmc = MCMC(kernel, num_warmup=nuts_warmup, num_samples=nuts_samples, progress_bar=progress_bar)
     mcmc.run(jax.random.PRNGKey(seed + 1), config)
     samples = mcmc.get_samples()

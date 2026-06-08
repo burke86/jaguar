@@ -101,6 +101,51 @@ def test_map_fit_defaults_to_image_fluxes_without_grahspj_likelihood(monkeypatch
     assert result.grahspj_state["pred_fluxes"].shape == (1,)
 
 
+def test_optax_nuts_uses_dense_mass_by_default(monkeypatch):
+    fit_mod = importlib.import_module("jaguar.fit")
+
+    calls = {}
+
+    def fake_fit_map(config, **_kwargs):
+        return SimpleNamespace(map_params={})
+
+    class FakeNUTS:
+        def __init__(self, model, *, init_strategy, dense_mass):
+            calls["model"] = model
+            calls["init_strategy"] = init_strategy
+            calls["dense_mass"] = dense_mass
+
+    class FakeMCMC:
+        def __init__(self, kernel, *, num_warmup, num_samples, progress_bar):
+            calls["kernel"] = kernel
+            calls["num_warmup"] = num_warmup
+            calls["num_samples"] = num_samples
+            calls["progress_bar"] = progress_bar
+
+        def run(self, *_args, **_kwargs):
+            calls["ran"] = True
+
+        def get_samples(self):
+            return {
+                "agn/hsc_i/log_flux": np.asarray([0.0]),
+                "host/hsc_i/log_flux": np.asarray([0.0]),
+            }
+
+    monkeypatch.setattr(fit_mod, "fit_map", fake_fit_map)
+    monkeypatch.setattr(fit_mod, "NUTS", FakeNUTS)
+    monkeypatch.setattr(fit_mod, "MCMC", FakeMCMC)
+
+    shape = (11, 11)
+    band = ImageBandData(np.zeros(shape), np.ones(shape), np.ones((5, 5)), "hsc_i", pixel_scale=0.168, counts_per_mjy=1.0)
+    cfg = JointFitConfig(image_bands=[band], image=ImageFitConfig(fit_background=False), grahspj_config=object())
+
+    result = fit_mod.fit(cfg, fit_method="optax+nuts", nuts_warmup=1, nuts_samples=1, progress_bar=False)
+
+    assert calls["dense_mass"] is True
+    assert calls["ran"] is True
+    assert result.samples is not None
+
+
 def test_map_fit_accepts_integer_background_default(monkeypatch):
     _fake_grahspj(monkeypatch, agn=1.0, host=2.0)
     shape = (11, 11)

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 from jaguar import ComponentFluxes, DetectedSource, ImageBandData, ImageFitConfig, JointFitConfig, SceneComponentConfig, SedComponentConfig, SourceDetectionConfig
 from jaguar.io import EmpiricalPsfBandResult, EmpiricalPsfConfig, EmpiricalPsfResult, PsfCandidate
 from jaguar.model import render_joint_model
-from jaguar.plotting import _radial_surface_brightness_profile, plot_config, plot_empirical_psf_selection, plot_fit, plot_psf_candidates, plot_sed
+from jaguar.plotting import _log_display_image, _radial_surface_brightness_profile, plot_config, plot_empirical_psf_selection, plot_fit, plot_psf_candidates, plot_sed
 from jaguar.result import JaguarResult
 
 
@@ -127,6 +127,18 @@ def test_plot_fit_accepts_shared_log_limits():
     assert len(fig.axes) == len(axes) + 2
     assert fig.axes[-2].get_ylabel() == "counts"
     assert fig.axes[-1].get_ylabel() == r"$(data-model)/\sigma$"
+    fig.clear()
+
+
+def test_plot_fit_auto_limits_match_target_image_display():
+    result = _result()
+
+    fig, axes = plot_fit(result, log_floor_fraction=1.0e-3)
+
+    _display, expected_vmin, expected_vmax = _log_display_image(result.config.image_bands[0].image, 1.0e-3)
+    norm = axes[0].images[0].norm
+    assert norm.vmin == expected_vmin
+    assert norm.vmax == expected_vmax
     fig.clear()
 
 
@@ -353,4 +365,117 @@ def test_plot_empirical_psf_selection_uses_common_result():
     assert axes[0].get_title() == "PSF candidates: g"
     assert axes[0].get_legend().texts[0].get_text() == "Selected PSF star"
     assert len(axes[0].patches) == 4
+    fig.clear()
+
+
+def test_plot_empirical_psf_selection_stacks_bands_in_rows():
+    image = np.ones((41, 41), dtype=float)
+    image[20, 20] = 100.0
+    selected = PsfCandidate(x_pix=12.0, y_pix=14.0, flux=10.0, size_pix=1.0, peak=5.0)
+    wcs = SimpleNamespace()
+    bands = {}
+    for band_code in ("FUV", "NUV"):
+        bands[band_code] = EmpiricalPsfBandResult(
+            band_code=band_code,
+            filter_name=f"galex.{band_code}",
+            image_path=SimpleNamespace(),
+            invvar_path=None,
+            psf=np.ones((5, 5), dtype=float) / 25.0,
+            psf_uncertainty=np.zeros((5, 5), dtype=float),
+            candidates=[selected],
+            selected_candidates=[selected],
+            search_image=image,
+            search_target_pixel=(20.0, 20.0),
+            search_wcs=wcs,
+            full_target_pixel=(20.0, 20.0),
+            search_origin=(0, 0),
+        )
+    result = EmpiricalPsfResult(
+        brick="GALEX",
+        image_bands=[],
+        bands=bands,
+        common_star_groups=[{"FUV": selected}, {"NUV": selected}],
+        config=EmpiricalPsfConfig(psf_size=11, target_exclusion_radius_pix=5.0),
+    )
+
+    fig, axes = plot_empirical_psf_selection(result)
+
+    assert len(axes) == 2
+    assert np.isclose(axes[0].get_position().x0, axes[1].get_position().x0)
+    assert axes[0].get_position().y0 > axes[1].get_position().y0
+    assert axes[0].get_title() == "PSF candidates: FUV"
+    assert axes[1].get_title() == "PSF candidates: NUV"
+    fig.clear()
+
+
+def test_plot_empirical_psf_selection_uses_percentile_log_scale():
+    image = np.ones((41, 41), dtype=float)
+    image[20, 20] = 1.2
+    image[5, 5] = 1.3
+    image[0, 0] = 1.0e6
+    selected = PsfCandidate(x_pix=12.0, y_pix=14.0, flux=10.0, size_pix=1.0, peak=5.0)
+    band = EmpiricalPsfBandResult(
+        band_code="FUV",
+        filter_name="galex.FUV",
+        image_path=SimpleNamespace(),
+        invvar_path=None,
+        psf=np.ones((5, 5), dtype=float) / 25.0,
+        psf_uncertainty=np.zeros((5, 5), dtype=float),
+        candidates=[selected],
+        selected_candidates=[selected],
+        search_image=image,
+        search_target_pixel=(20.0, 20.0),
+        search_wcs=SimpleNamespace(),
+        full_target_pixel=(20.0, 20.0),
+        search_origin=(0, 0),
+    )
+    result = EmpiricalPsfResult(
+        brick="GALEX",
+        image_bands=[],
+        bands={"FUV": band},
+        common_star_groups=[{"FUV": selected}],
+        config=EmpiricalPsfConfig(psf_size=11, target_exclusion_radius_pix=5.0),
+    )
+
+    fig, axes = plot_empirical_psf_selection(result, display_percentiles=(5.0, 99.0))
+
+    assert axes[0].images[0].norm.vmax < 1.0e6
+    fig.clear()
+
+
+def test_plot_empirical_psf_selection_ignores_search_mask_for_scale():
+    image = np.ones((41, 41), dtype=float)
+    image[0:10, :] = 0.0
+    image[0, 0] = 1.0e6
+    mask = image > 0.0
+    mask[0:10, :] = False
+    selected = PsfCandidate(x_pix=20.0, y_pix=20.0, flux=10.0, size_pix=1.0, peak=5.0)
+    band = EmpiricalPsfBandResult(
+        band_code="FUV",
+        filter_name="galex.FUV",
+        image_path=SimpleNamespace(),
+        invvar_path=None,
+        psf=np.ones((5, 5), dtype=float) / 25.0,
+        psf_uncertainty=np.zeros((5, 5), dtype=float),
+        candidates=[selected],
+        selected_candidates=[selected],
+        search_image=image,
+        search_mask=mask,
+        search_target_pixel=(20.0, 20.0),
+        search_wcs=SimpleNamespace(),
+        full_target_pixel=(20.0, 20.0),
+        search_origin=(0, 0),
+    )
+    result = EmpiricalPsfResult(
+        brick="GALEX",
+        image_bands=[],
+        bands={"FUV": band},
+        common_star_groups=[{"FUV": selected}],
+        config=EmpiricalPsfConfig(psf_size=11, target_exclusion_radius_pix=5.0),
+    )
+
+    fig, axes = plot_empirical_psf_selection(result, display_percentiles=(5.0, 99.0))
+
+    assert axes[0].images[0].norm.vmax < 1.0e6
+    assert np.all(np.asarray(axes[0].images[0].get_array())[~mask] == axes[0].images[0].norm.vmin)
     fig.clear()

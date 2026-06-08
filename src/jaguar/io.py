@@ -21,6 +21,17 @@ GALIGHT_HSC_DRIVE_ID = "1ZO9-HzV8K60ijYWK98jGoSoZHjIGW5Lc"
 GALIGHT_HSC_QSO_IMAGE = "example_data/HSC/QSO/000017.88+002612.6_HSC-I.fits"
 GALIGHT_HSC_QSO_PSF = "example_data/HSC/QSO/000017.88+002612.6_HSC-I_psf.fits"
 LEGACY_SURVEY_DR10_BASE_URL = "https://portal.nersc.gov/cfs/cosmo/data/legacysurvey/dr10"
+GALEX_AB_ZERPOINTS = {"FUV": 18.82, "NUV": 20.08}
+
+
+@dataclass(frozen=True)
+class GalexCoaddProduct:
+    """A whole GALEX coadd image product available from MAST."""
+
+    band: str
+    obs_id: str
+    product_filename: str
+    data_uri: str
 
 
 @dataclass(frozen=True)
@@ -76,7 +87,7 @@ class EmpiricalPsfBandResult:
     band_code: str
     filter_name: str
     image_path: Path
-    invvar_path: Path
+    invvar_path: Path | None
     psf: np.ndarray
     candidates: list[PsfCandidate]
     selected_candidates: list[PsfCandidate]
@@ -86,6 +97,7 @@ class EmpiricalPsfBandResult:
     full_target_pixel: tuple[float, float]
     search_origin: tuple[int, int]
     psf_uncertainty: np.ndarray | None = None
+    search_mask: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -218,6 +230,230 @@ def download_legacy_survey_coadd_band(
     _download_url(legacy_survey_coadd_url(brick, band, kind="image", base_url=base_url, region=region), image_path, overwrite=overwrite)
     _download_url(legacy_survey_coadd_url(brick, band, kind="invvar", base_url=base_url, region=region), invvar_path, overwrite=overwrite)
     return image_path, invvar_path
+
+
+def _row_value(row: Any, name: str, default: Any = "") -> Any:
+    try:
+        value = row[name]
+    except Exception:
+        return default
+    if np.ma.is_masked(value):
+        return default
+    try:
+        if np.asarray(value).shape == ():
+            value = value.item()
+    except Exception:
+        pass
+    return value
+
+
+def _galex_product_band(row: Any) -> str:
+    filters = str(_row_value(row, "filters", "")).strip().upper()
+    if filters in {"FUV", "NUV"}:
+        return filters
+    filename = str(_row_value(row, "productFilename", "")).lower()
+    if "-fd-" in filename:
+        return "FUV"
+    if "-nd-" in filename:
+        return "NUV"
+    return filters
+
+
+def _galex_intensity_product_rows(products: Any, band: str, *, main_coadd_only: bool = True) -> list[Any]:
+    band = str(band).upper()
+    detector = {"FUV": "fd", "NUV": "nd"}.get(band)
+    if detector is None:
+        raise ValueError("GALEX band must be 'FUV' or 'NUV'.")
+    rows: list[Any] = []
+    for row in products:
+        filename = str(_row_value(row, "productFilename", ""))
+        data_uri = str(_row_value(row, "dataURI", ""))
+        if _galex_product_band(row) != band:
+            continue
+        if str(_row_value(row, "productType", "")).upper() != "SCIENCE":
+            continue
+        if not filename.endswith(f"-{detector}-int.fits.gz"):
+            continue
+        if main_coadd_only and "/d/01-main/" not in data_uri:
+            continue
+        rows.append(row)
+    rows.sort(key=lambda row: str(_row_value(row, "productFilename", "")))
+    return rows
+
+
+def query_galex_coadd_products(
+    target_ra_dec: tuple[float, float],
+    *,
+    radius_deg: float = 0.3,
+    bands: tuple[str, ...] = ("FUV", "NUV"),
+    main_coadd_only: bool = True,
+) -> dict[str, list[GalexCoaddProduct]]:
+    """Query MAST for whole GALEX coadd intensity products near a coordinate.
+
+    This returns full GALEX coadd products, not coordinate cutouts. The
+    returned products should be WCS-checked before use because a MAST region
+    query can return nearby coadd tiles whose image footprint misses the exact
+    target coordinate.
+    """
+
+    try:
+        from astropy.coordinates import SkyCoord
+        import astropy.units as u
+        from astroquery.mast import Observations
+    except ImportError as exc:
+        raise ImportError("query_galex_coadd_products requires astroquery and astropy.") from exc
+
+    coord = SkyCoord(float(target_ra_dec[0]), float(target_ra_dec[1]), unit="deg")
+    observations = Observations.query_criteria(
+        coordinates=coord,
+        radius=float(radius_deg) * u.deg,
+        obs_collection="GALEX",
+        dataproduct_type="image",
+    )
+    if len(observations) == 0:
+        raise ValueError(f"No GALEX image observations found near RA={target_ra_dec[0]}, Dec={target_ra_dec[1]}.")
+    products = Observations.get_product_list(observations)
+    result: dict[str, list[GalexCoaddProduct]] = {}
+    for band in bands:
+        band_key = str(band).upper()
+        rows = _galex_intensity_product_rows(products, band_key, main_coadd_only=main_coadd_only)
+        result[band_key] = [
+            GalexCoaddProduct(
+                band=band_key,
+                obs_id=str(_row_value(row, "obsID", _row_value(row, "obsid", ""))),
+                product_filename=str(_row_value(row, "productFilename", "")),
+                data_uri=str(_row_value(row, "dataURI", "")),
+            )
+            for row in rows
+        ]
+    return result
+
+
+def _fits_contains_world(path: str | Path, target_ra_dec: tuple[float, float]) -> bool:
+    with fits.open(path) as hdul:
+        image, header = _first_2d_image_hdu(hdul)
+        wcs = WCS(header, naxis=2)
+        pix = wcs.all_world2pix([[float(target_ra_dec[0]), float(target_ra_dec[1])]], 1)[0]
+    x, y = float(pix[0]), float(pix[1])
+    ny, nx = image.shape
+    return np.isfinite(x) and np.isfinite(y) and 0.5 <= x <= nx + 0.5 and 0.5 <= y <= ny + 0.5
+
+
+def _fits_has_covered_world(path: str | Path, target_ra_dec: tuple[float, float]) -> bool:
+    with fits.open(path) as hdul:
+        image, header = _first_2d_image_hdu(hdul)
+        wcs = WCS(header, naxis=2)
+        pix = wcs.all_world2pix([[float(target_ra_dec[0]), float(target_ra_dec[1])]], 1)[0]
+    x, y = float(pix[0]), float(pix[1])
+    ny, nx = image.shape
+    if not (np.isfinite(x) and np.isfinite(y) and 0.5 <= x <= nx + 0.5 and 0.5 <= y <= ny + 0.5):
+        return False
+    ix = int(round(x)) - 1
+    iy = int(round(y)) - 1
+    x0 = max(0, ix - 1)
+    x1 = min(nx, ix + 2)
+    y0 = max(0, iy - 1)
+    y1 = min(ny, iy + 2)
+    footprint = np.asarray(image[y0:y1, x0:x1], dtype=float)
+    return bool(np.any(np.isfinite(footprint) & (footprint > 0.0)))
+
+
+def _cached_galex_coadd_blocks(
+    output_dir: str | Path,
+    target_ra_dec: tuple[float, float],
+    bands: tuple[str, ...],
+) -> dict[str, Path]:
+    output_dir = Path(output_dir)
+    if not output_dir.exists():
+        return {}
+    cached: dict[str, Path] = {}
+    suffix_by_band = {"FUV": "-fd-int.fits.gz", "NUV": "-nd-int.fits.gz"}
+    for band in bands:
+        band_key = str(band).upper()
+        suffix = suffix_by_band.get(band_key)
+        if suffix is None:
+            continue
+        matches = sorted(output_dir.rglob(f"*{suffix}"))
+        for path in matches:
+            try:
+                contains_target = _fits_has_covered_world(path, target_ra_dec)
+            except Exception:
+                continue
+            if contains_target:
+                cached[band_key] = path
+                break
+    return cached
+
+
+def _galex_coverage_mask(image: np.ndarray) -> np.ndarray:
+    """Return the valid exposed GALEX footprint mask for an intensity image."""
+
+    image = np.asarray(image, dtype=float)
+    return np.isfinite(image) & (image > 0.0)
+
+
+def _fill_uncovered_pixels(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Replace uncovered pixels with the median covered value for detection."""
+
+    image = np.asarray(image, dtype=float)
+    mask = np.asarray(mask, dtype=bool)
+    covered = image[mask & np.isfinite(image)]
+    fill_value = float(np.nanmedian(covered)) if covered.size else 0.0
+    return np.where(mask & np.isfinite(image), image, fill_value)
+
+
+def download_galex_coadd_blocks(
+    output_dir: str | Path,
+    target_ra_dec: tuple[float, float],
+    *,
+    radius_deg: float = 0.3,
+    bands: tuple[str, ...] = ("FUV", "NUV"),
+    main_coadd_only: bool = True,
+    overwrite: bool = False,
+) -> dict[str, Path]:
+    """Download whole GALEX coadd intensity images containing a coordinate.
+
+    Candidate MAST products are downloaded as full coadd FITS files, then
+    selected by checking whether their WCS footprint contains ``target_ra_dec``.
+    """
+
+    try:
+        from astroquery.mast import Observations
+    except ImportError as exc:
+        raise ImportError("download_galex_coadd_blocks requires astroquery.") from exc
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    requested_bands = tuple(str(band).upper() for band in bands)
+    if not overwrite:
+        cached = _cached_galex_coadd_blocks(output_dir, target_ra_dec, requested_bands)
+        if all(band in cached for band in requested_bands):
+            return {band: cached[band] for band in requested_bands}
+    products_by_band = query_galex_coadd_products(
+        target_ra_dec,
+        radius_deg=radius_deg,
+        bands=requested_bands,
+        main_coadd_only=main_coadd_only,
+    )
+    selected: dict[str, Path] = {}
+    for band, products in products_by_band.items():
+        if not products:
+            raise ValueError(f"No GALEX {band} coadd intensity products found near RA={target_ra_dec[0]}, Dec={target_ra_dec[1]}.")
+        checked_paths: list[Path] = []
+        for product in products:
+            if not product.data_uri:
+                continue
+            local_path = output_dir / product.product_filename
+            if overwrite or not local_path.exists():
+                Observations.download_file(product.data_uri, local_path=str(local_path), cache=not overwrite, verbose=False)
+            checked_paths.append(local_path)
+            if _fits_has_covered_world(local_path, target_ra_dec):
+                selected[band] = local_path
+                break
+        if band not in selected:
+            filenames = ", ".join(path.name for path in checked_paths)
+            raise ValueError(f"Downloaded GALEX {band} coadd candidates, but none have target-coordinate coverage: {filenames}")
+    return selected
 
 
 def _mad_std(values: np.ndarray) -> float:
@@ -414,7 +650,7 @@ def _select_empirical_psf_candidates(
     if diagnostics is not None:
         diagnostics["detected_segments"] = len(all_sources)
 
-    candidates: list[PsfCandidate] = []
+    cheap_sources: list[tuple[int, float, float, float, float, float]] = []
     for label, x, y, size, flux, peak in all_sources:
         if np.hypot(x - tx, y - ty) <= float(target_exclusion_radius_pix):
             if diagnostics is not None:
@@ -432,6 +668,15 @@ def _select_empirical_psf_candidates(
             if diagnostics is not None:
                 diagnostics["nonpositive_flux"] += 1
             continue
+        cheap_sources.append((label, x, y, size, flux, peak))
+    cheap_sources.sort(key=lambda source: source[4], reverse=True)
+    if len(cheap_sources) > int(max_sources):
+        if diagnostics is not None:
+            diagnostics["candidate_pool_limit"] += len(cheap_sources) - int(max_sources)
+        cheap_sources = cheap_sources[: int(max_sources)]
+
+    candidates: list[PsfCandidate] = []
+    for label, x, y, size, flux, peak in cheap_sources:
         stamp = _cutout(source_image, (x, y), half)
         inner_radius = float(half) + 1.0
         outer_radius = max(inner_radius + 2.0, float(half) * 1.8)
@@ -494,8 +739,6 @@ def _select_empirical_psf_candidates(
         if diagnostics is not None:
             diagnostics["gaia_match"] += before_gaia - len(candidates)
     if diagnostics is not None:
-        if len(candidates) > int(max_sources):
-            diagnostics["candidate_pool_limit"] += len(candidates) - int(max_sources)
         diagnostics["accepted"] = min(len(candidates), int(max_sources))
     return candidates[: int(max_sources)]
 
@@ -959,6 +1202,13 @@ def _format_psf_candidate_diagnostics(band_code: str, diagnostics: Counter[str])
     return "\n".join(lines)
 
 
+def _validate_empirical_psf_config(cfg: EmpiricalPsfConfig) -> None:
+    if cfg.psf_size % 2 == 0:
+        raise ValueError("psf_size must be odd.")
+    if int(cfg.psf_padding_pixels) != cfg.psf_padding_pixels or cfg.psf_padding_pixels < 0:
+        raise ValueError("psf_padding_pixels must be a non-negative integer.")
+
+
 def build_empirical_psfs_for_bands(
     *,
     band_specs: dict[str, str],
@@ -974,10 +1224,7 @@ def build_empirical_psfs_for_bands(
     """Download/cache Legacy Survey coadds and build empirical PSFs for several bands."""
 
     cfg = EmpiricalPsfConfig() if config is None else config
-    if cfg.psf_size % 2 == 0:
-        raise ValueError("psf_size must be odd.")
-    if int(cfg.psf_padding_pixels) != cfg.psf_padding_pixels or cfg.psf_padding_pixels < 0:
-        raise ValueError("psf_padding_pixels must be a non-negative integer.")
+    _validate_empirical_psf_config(cfg)
     data_dir = Path(data_dir)
     if brick is None:
         bricks_path = download_legacy_survey_bricks_table(data_dir, base_url=base_url, region=region) if bricks_fits is None else Path(bricks_fits)
@@ -1116,6 +1363,191 @@ def build_empirical_psfs_for_bands(
         bands=band_results,
         common_star_groups=groups,
         config=cfg,
+    )
+
+
+def build_empirical_psfs_for_galex_bands(
+    *,
+    band_specs: dict[str, str] | None = None,
+    target_ra_dec: tuple[float, float],
+    data_dir: str | Path,
+    fit_radius: int = 45,
+    radius_deg: float = 0.3,
+    zeropoints: dict[str, float] | None = None,
+    config: EmpiricalPsfConfig | None = None,
+) -> EmpiricalPsfResult:
+    """Download/cache GALEX coadd blocks and build empirical PSFs for FUV/NUV.
+
+    This follows the Legacy Survey empirical-PSF flow: download whole coadd
+    images, cut a local search image, select compact PSF stars, stack them, and
+    cut the target stamp locally.
+    """
+
+    cfg = EmpiricalPsfConfig() if config is None else config
+    _validate_empirical_psf_config(cfg)
+    band_specs = {"FUV": "galex.FUV", "NUV": "galex.NUV"} if band_specs is None else {str(k).upper(): v for k, v in band_specs.items()}
+    zeropoints = GALEX_AB_ZERPOINTS if zeropoints is None else {str(k).upper(): float(v) for k, v in zeropoints.items()}
+    band_codes = list(band_specs)
+    data_dir = Path(data_dir)
+    paths_by_band = download_galex_coadd_blocks(
+        data_dir,
+        target_ra_dec,
+        radius_deg=radius_deg,
+        bands=tuple(band_codes),
+    )
+
+    images_by_band: dict[str, np.ndarray] = {}
+    headers_by_band: dict[str, Any] = {}
+    search_images: dict[str, np.ndarray] = {}
+    search_masks: dict[str, np.ndarray] = {}
+    search_targets: dict[str, tuple[float, float]] = {}
+    search_wcs_by_band: dict[str, WCS] = {}
+    full_targets: dict[str, tuple[float, float]] = {}
+    origins: dict[str, tuple[int, int]] = {}
+    candidates_by_band: dict[str, list[PsfCandidate]] = {}
+
+    for band_code in band_codes:
+        image_path = paths_by_band[band_code]
+        full_image, full_header = read_legacy_survey_coadd_image(image_path)
+        wcs = WCS(full_header, naxis=2)
+        pix = wcs.all_world2pix([[target_ra_dec[0], target_ra_dec[1]]], 1)[0]
+        target_pixel = (float(pix[0]), float(pix[1]))
+        search_image, search_target, search_wcs, origin = _search_cutout_and_wcs(full_image, wcs, target_pixel, cfg.psf_search_radius)
+        search_mask = _galex_coverage_mask(search_image)
+        search_detection_image = _fill_uncovered_pixels(search_image, search_mask)
+        diagnostics: Counter[str] = Counter()
+        candidates = find_empirical_psf_candidates(
+            search_detection_image,
+            target_pixel=search_target,
+            wcs=search_wcs if (cfg.require_gaia_match or cfg.annotate_gaia_matches) else None,
+            psf_size=cfg.psf_size,
+            threshold_sigma=cfg.threshold_sigma,
+            npixels=cfg.npixels,
+            min_sources=cfg.min_sources,
+            max_sources=max(int(cfg.candidate_pool_size), int(cfg.max_sources)),
+            target_exclusion_radius_pix=cfg.target_exclusion_radius_pix,
+            min_size_pix=cfg.min_size_pix,
+            max_size_pix=cfg.max_size_pix,
+            max_peak_percentile=cfg.max_peak_percentile,
+            max_edge_flux_fraction=cfg.max_edge_flux_fraction,
+            saturation_peak_fraction=cfg.saturation_peak_fraction,
+            max_saturated_pixels=cfg.max_saturated_pixels,
+            isolation_radius_pix=cfg.isolation_radius_pix,
+            max_neighbor_flux_ratio=cfg.max_neighbor_flux_ratio,
+            max_fwhm_fractional_scatter=cfg.max_fwhm_fractional_scatter,
+            gaia_match_radius_arcsec=cfg.gaia_match_radius_arcsec,
+            gaia_xmatch_timeout=cfg.gaia_xmatch_timeout,
+            require_gaia_match=cfg.require_gaia_match,
+            diagnostics=diagnostics,
+        )
+        images_by_band[band_code] = full_image
+        headers_by_band[band_code] = full_header
+        search_images[band_code] = search_image
+        search_masks[band_code] = search_mask
+        search_targets[band_code] = search_target
+        search_wcs_by_band[band_code] = search_wcs
+        full_targets[band_code] = target_pixel
+        origins[band_code] = origin
+        candidates_by_band[band_code] = candidates
+        if cfg.print_diagnostics:
+            print(_format_psf_candidate_diagnostics(band_code, diagnostics))
+
+    groups = _match_psf_candidates_across_bands(
+        candidates_by_band,
+        search_wcs_by_band,
+        radius_arcsec=cfg.common_match_radius_arcsec,
+    )
+    selected_by_band = _select_common_psf_candidates(
+        candidates_by_band,
+        groups,
+        band_codes=band_codes,
+        prefer_common_stars=cfg.prefer_common_stars,
+        min_common_bands=cfg.min_common_bands,
+        max_sources=cfg.max_sources,
+        min_sources=cfg.min_sources,
+    )
+
+    image_bands: list[ImageBandData] = []
+    band_results: dict[str, EmpiricalPsfBandResult] = {}
+    for band_code in band_codes:
+        covered_values = search_images[band_code][search_masks[band_code]]
+        background = float(np.nanmedian(covered_values)) if covered_values.size else float(np.nanmedian(search_images[band_code]))
+        source_image = np.where(search_masks[band_code], search_images[band_code] - background, 0.0)
+        psf, psf_uncertainty = _construct_empirical_psf_from_candidates(
+            source_image,
+            selected_by_band[band_code],
+            target_pixel=search_targets[band_code],
+            psf_size=cfg.psf_size,
+            min_sources=cfg.min_sources,
+            weight_image=None,
+            max_edge_flux_fraction=cfg.max_edge_flux_fraction,
+            saturation_peak_fraction=cfg.saturation_peak_fraction,
+            max_saturated_pixels=cfg.max_saturated_pixels,
+            return_uncertainty=True,
+        )
+        image_path = paths_by_band[band_code]
+        image_band = load_galex_coadd_band(
+            image_path,
+            filter_name=band_specs[band_code],
+            target_ra_dec=target_ra_dec,
+            radius=fit_radius,
+            psf=psf,
+            psf_uncertainty=psf_uncertainty,
+            zeropoint=zeropoints[band_code],
+            psf_padding_pixels=cfg.psf_padding_pixels,
+        )
+        image_bands.append(image_band)
+        band_results[band_code] = EmpiricalPsfBandResult(
+            band_code=band_code,
+            filter_name=band_specs[band_code],
+            image_path=image_path,
+            invvar_path=None,
+            psf=psf,
+            psf_uncertainty=psf_uncertainty,
+            candidates=candidates_by_band[band_code],
+            selected_candidates=selected_by_band[band_code],
+            search_image=search_images[band_code],
+            search_target_pixel=search_targets[band_code],
+            search_wcs=search_wcs_by_band[band_code],
+            full_target_pixel=full_targets[band_code],
+            search_origin=origins[band_code],
+            search_mask=search_masks[band_code],
+        )
+
+    return EmpiricalPsfResult(
+        brick="GALEX",
+        image_bands=image_bands,
+        bands=band_results,
+        common_star_groups=groups,
+        config=cfg,
+    )
+
+
+def combine_empirical_psf_results(*results: EmpiricalPsfResult) -> EmpiricalPsfResult:
+    """Combine empirical PSF results for plotting and downstream image fitting."""
+
+    valid_results = [result for result in results if result is not None]
+    if not valid_results:
+        raise ValueError("At least one empirical PSF result is required.")
+    first = valid_results[0]
+    image_bands: list[ImageBandData] = []
+    bands: dict[str, EmpiricalPsfBandResult] = {}
+    common_star_groups: list[dict[str, PsfCandidate]] = []
+    bricks: list[str] = []
+    for result in valid_results:
+        image_bands.extend(result.image_bands)
+        overlap = set(bands).intersection(result.bands)
+        if overlap:
+            raise ValueError(f"Cannot combine empirical PSF results with duplicate band codes: {sorted(overlap)}")
+        bands.update(result.bands)
+        common_star_groups.extend(result.common_star_groups)
+        bricks.append(str(result.brick))
+    return EmpiricalPsfResult(
+        brick="+".join(bricks),
+        image_bands=image_bands,
+        bands=bands,
+        common_star_groups=common_star_groups,
+        config=first.config,
     )
 
 
@@ -1333,6 +1765,66 @@ def load_legacy_survey_coadd_band(
         psf_uncertainty=None if psf_uncertainty is None else np.asarray(psf_uncertainty, dtype=float),
         zeropoint=zeropoint,
         counts_per_mjy=nanomaggy_counts_per_mjy() if np.isclose(float(zeropoint), 22.5) else counts_per_mjy_from_ab_zeropoint(zeropoint),
+        mask=valid_mask,
+        header=dict(header),
+        target_pixel=target_pixel,
+        psf_padding_pixels=psf_padding_pixels,
+    )
+    band.validate()
+    return band
+
+
+def load_galex_coadd_band(
+    image_fits: str | Path,
+    *,
+    filter_name: str,
+    target_ra_dec: tuple[float, float],
+    radius: int,
+    psf: np.ndarray,
+    zeropoint: float,
+    psf_uncertainty: np.ndarray | None = None,
+    subtract_edge_background: bool = False,
+    psf_padding_pixels: int = 20,
+) -> ImageBandData:
+    """Load a local stamp from a whole GALEX coadd intensity image.
+
+    GALEX intensity maps are in counts/sec/pixel. The supplied zeropoint should
+    be the AB counts/sec zeropoint for the band.
+    """
+
+    with fits.open(image_fits) as image_hdul:
+        image, header = _first_2d_image_hdu(image_hdul)
+        wcs = WCS(header, naxis=2)
+        pix = wcs.all_world2pix([[target_ra_dec[0], target_ra_dec[1]]], 1)[0]
+        target_pixel = (float(pix[0]), float(pix[1]))
+        scale = wcs.proj_plane_pixel_scales()[0]
+        pixel_scale = abs(float(scale.to_value("deg") if hasattr(scale, "to_value") else scale)) * 3600.0
+        image_cutout = _cutout(image, target_pixel, radius)
+        coverage_cutout = _galex_coverage_mask(image_cutout)
+        edge_mask = np.concatenate([coverage_cutout[0], coverage_cutout[-1], coverage_cutout[:, 0], coverage_cutout[:, -1]])
+        edge = np.concatenate([image_cutout[0], image_cutout[-1], image_cutout[:, 0], image_cutout[:, -1]])[edge_mask]
+        if edge.size == 0:
+            edge = image_cutout[coverage_cutout]
+        if edge.size == 0:
+            edge = image_cutout[np.isfinite(image_cutout)]
+        background = float(np.nanmedian(edge)) if edge.size else 0.0
+        noise_level = 1.4826 * float(np.nanmedian(np.abs(edge - background))) if edge.size else 1.0e-6
+        if subtract_edge_background:
+            image_cutout = image_cutout - background
+        image_cutout = np.nan_to_num(image_cutout, nan=0.0, posinf=0.0, neginf=0.0)
+        noise = np.full_like(image_cutout, max(noise_level, 1.0e-6), dtype=float)
+        valid_mask = coverage_cutout & np.isfinite(image_cutout)
+        noise = np.where(valid_mask, noise, 1.0e30)
+
+    band = ImageBandData(
+        image=image_cutout,
+        noise=noise,
+        psf=np.asarray(psf, dtype=float),
+        filter_name=filter_name,
+        pixel_scale=pixel_scale,
+        psf_uncertainty=None if psf_uncertainty is None else np.asarray(psf_uncertainty, dtype=float),
+        zeropoint=zeropoint,
+        counts_per_mjy=counts_per_mjy_from_ab_zeropoint(zeropoint),
         mask=valid_mask,
         header=dict(header),
         target_pixel=target_pixel,
